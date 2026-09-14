@@ -5,6 +5,7 @@ package rxqueue
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"slices"
@@ -28,6 +29,7 @@ const (
 	testHostIndex      = 20
 	testPeerIndex      = 21
 	testShareID        = kube_types.UID("11111111-2222-3333-4444-555555555555")
+	testDestinationMAC = "02:00:00:00:00:02"
 )
 
 func publishedDevices(t *testing.T, mgr *RXQueueManager) []types.Device {
@@ -43,24 +45,34 @@ func publishedDevices(t *testing.T, mgr *RXQueueManager) []types.Device {
 }
 
 type fakeNetlink struct {
-	links          map[string]netlink.Link
-	leases         map[uint32]*netlink.NetDevQueueLease
-	addedNetkit    *netlink.Netkit
-	createErrors   map[uint32]error
-	createRequests []netlink.NetDevQueueCreateRequest
-	realRXQueues   int
-	rss            netlink.NetDevRSS
-	rings          netlink.NetDevRings
-	rssSetCalls    []netlink.NetDevRSSConfig
-	ringsSetCalls  []netlink.NetDevRingsConfig
-	rssSetError    error
-	ringsSetError  error
-	ignoreRSSSet   bool
-	ignoreRingsSet bool
-	hostIfName     string
-	peerIfName     string
-	addCalls       int
-	deleteCalls    int
+	links              map[string]netlink.Link
+	leases             map[uint32]*netlink.NetDevQueueLease
+	addedNetkit        *netlink.Netkit
+	createErrors       map[uint32]error
+	createRequests     []netlink.NetDevQueueCreateRequest
+	realRXQueues       int
+	rss                netlink.NetDevRSS
+	rings              netlink.NetDevRings
+	rssSetCalls        []netlink.NetDevRSSConfig
+	ringsSetCalls      []netlink.NetDevRingsConfig
+	rssSetError        error
+	ringsSetError      error
+	ignoreRSSSet       bool
+	ignoreRingsSet     bool
+	flows              map[uint32]netlink.NetDevRxFlow
+	flowInsertRequests []netlink.NetDevRxFlow
+	flowDeleteRequests []uint32
+	flowInsertError    error
+	flowDeleteError    error
+	flowListError      error
+	flowAliasError     error
+	ignoreFlowInsert   bool
+	ignoreFlowDelete   bool
+	nextFlowLocation   uint32
+	hostIfName         string
+	peerIfName         string
+	addCalls           int
+	deleteCalls        int
 }
 
 func newFakeNetlink(maxRXQueues, realRXQueues int, shareID kube_types.UID) *fakeNetlink {
@@ -99,8 +111,10 @@ func newFakeNetlink(maxRXQueues, realRXQueues int, shareID kube_types.UID) *fake
 			TCPDataSplit:    netlink.NetDevTCPDataSplitDisabled,
 			HDSThresholdMax: 4096,
 		},
-		hostIfName: hostIfName,
-		peerIfName: peerIfName,
+		flows:            make(map[uint32]netlink.NetDevRxFlow),
+		nextFlowLocation: 100,
+		hostIfName:       hostIfName,
+		peerIfName:       peerIfName,
 	}
 }
 
@@ -118,6 +132,9 @@ func (f *fakeNetlink) install(t *testing.T) {
 	originalRSSSet := netlinkNetDevRSSSet
 	originalRingsGet := netlinkNetDevRingsGet
 	originalRingsSet := netlinkNetDevRingsSet
+	originalFlowInsert := netlinkNetDevRxFlowInsert
+	originalFlowDelete := netlinkNetDevRxFlowDelete
+	originalFlowList := netlinkNetDevRxFlowList
 	t.Cleanup(func() {
 		netlinkLinkByName = originalLinkByName
 		netlinkLinkAdd = originalLinkAdd
@@ -130,6 +147,9 @@ func (f *fakeNetlink) install(t *testing.T) {
 		netlinkNetDevRSSSet = originalRSSSet
 		netlinkNetDevRingsGet = originalRingsGet
 		netlinkNetDevRingsSet = originalRingsSet
+		netlinkNetDevRxFlowInsert = originalFlowInsert
+		netlinkNetDevRxFlowDelete = originalFlowDelete
+		netlinkNetDevRxFlowList = originalFlowList
 	})
 
 	netlinkLinkByName = func(name string) (netlink.Link, error) {
@@ -173,6 +193,10 @@ func (f *fakeNetlink) install(t *testing.T) {
 		return nil
 	}
 	netlinkLinkSetAlias = func(link netlink.Link, alias string) error {
+		if f.flowAliasError != nil && link.Attrs().Name == f.hostIfName &&
+			alias != ownershipAlias(f.hostIfName) {
+			return f.flowAliasError
+		}
 		link.Attrs().Alias = alias
 		return nil
 	}
@@ -260,6 +284,62 @@ func (f *fakeNetlink) install(t *testing.T) {
 		}
 		return nil
 	}
+	netlinkNetDevRxFlowInsert = func(dev string, flow netlink.NetDevRxFlow) (uint32, error) {
+		if dev != testPhysicalIfName {
+			return 0, unix.ENODEV
+		}
+		f.flowInsertRequests = append(f.flowInsertRequests, flow)
+		if f.flowInsertError != nil {
+			return 0, f.flowInsertError
+		}
+		if f.leases[flow.Queue] == nil {
+			return 0, errors.New("RX flow inserted before queue lease")
+		}
+
+		location := flow.Location
+		if location == netlink.RX_CLS_LOC_ANY {
+			location = f.nextFlowLocation
+			for {
+				if _, exists := f.flows[location]; !exists {
+					break
+				}
+				location++
+			}
+			f.nextFlowLocation = location + 1
+		}
+		flow.Location = location
+		if !f.ignoreFlowInsert {
+			f.flows[location] = flow
+		}
+		return location, nil
+	}
+	netlinkNetDevRxFlowDelete = func(dev string, location uint32) error {
+		if dev != testPhysicalIfName {
+			return unix.ENODEV
+		}
+		f.flowDeleteRequests = append(f.flowDeleteRequests, location)
+		if f.flowDeleteError != nil {
+			return f.flowDeleteError
+		}
+		if !f.ignoreFlowDelete {
+			delete(f.flows, location)
+		}
+		return nil
+	}
+	netlinkNetDevRxFlowList = func(dev string) ([]uint32, error) {
+		if dev != testPhysicalIfName {
+			return nil, unix.ENODEV
+		}
+		if f.flowListError != nil {
+			return nil, f.flowListError
+		}
+		locations := make([]uint32, 0, len(f.flows))
+		for location := range f.flows {
+			locations = append(locations, location)
+		}
+		slices.Sort(locations)
+		return locations, nil
+	}
 }
 
 func testDevice(total int) *RXQueueDevice {
@@ -278,10 +358,27 @@ func testDeviceWithCount(total, count int) *RXQueueDevice {
 
 func testAllocation(shareID kube_types.UID) types.DeviceAllocation {
 	return types.DeviceAllocation{
+		Config: types.DeviceConfig{RXQueue: &types.RXQueueConfig{
+			DestinationMAC: testDestinationMAC,
+		}},
 		ShareID: shareID,
 		ConsumedCapacity: map[resourceapi.QualifiedName]apiresource.Quantity{
 			types.RXQueuesCapacity: apiresource.MustParse("1"),
 		},
+	}
+}
+
+func testRXFlow(queueID, location uint32) netlink.NetDevRxFlow {
+	destinationMAC, err := net.ParseMAC(testDestinationMAC)
+	if err != nil {
+		panic(err)
+	}
+	return netlink.NetDevRxFlow{
+		Match: netlink.EtherFlow{
+			DstMAC:     destinationMAC,
+			DstMACMask: net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+		},
+		Queue: queueID, Location: location,
 	}
 }
 
@@ -632,6 +729,77 @@ func TestAllocationIfNames(t *testing.T) {
 	require.NotEqual(t, peer0, peer1)
 }
 
+func TestRXFlowForAllocation(t *testing.T) {
+	tests := []struct {
+		name string
+		mac  string
+	}{
+		{name: "empty"},
+		{name: "invalid", mac: "not-a-mac"},
+		{name: "EUI-64", mac: "02:00:00:ff:fe:00:00:02"},
+		{name: "multicast", mac: "01:00:5e:00:00:01"},
+		{name: "zero", mac: "00:00:00:00:00:00"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allocation := testAllocation(testShareID)
+			allocation.Config.RXQueue.DestinationMAC = tt.mac
+
+			_, _, err := rxFlowForAllocation(allocation)
+			require.ErrorIs(t, err, errInvalidAllocation)
+		})
+	}
+
+	t.Run("missing RX queue config", func(t *testing.T) {
+		allocation := testAllocation(testShareID)
+		allocation.Config.RXQueue = nil
+
+		_, _, err := rxFlowForAllocation(allocation)
+		require.ErrorIs(t, err, errInvalidAllocation)
+	})
+
+	t.Run("exact destination MAC", func(t *testing.T) {
+		allocation := testAllocation(testShareID)
+		allocation.Config.RXQueue.DestinationMAC = "02-00-00-00-00-AB"
+
+		flow, normalizedMAC, err := rxFlowForAllocation(allocation)
+		require.NoError(t, err)
+		require.Equal(t, "02:00:00:00:00:ab", normalizedMAC)
+		require.Equal(t, net.HardwareAddr{0x02, 0, 0, 0, 0, 0xab}, flow.DstMAC)
+		require.Equal(t, net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, flow.DstMACMask)
+		require.Nil(t, flow.SrcMAC)
+		require.Nil(t, flow.SrcMACMask)
+		require.Zero(t, flow.EthProto)
+		require.Zero(t, flow.ProtoMask)
+	})
+}
+
+func TestOwnedRXFlow(t *testing.T) {
+	hostIfName, _ := allocationIfNames(testPhysicalIfName, testShareID)
+	link := &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{Name: hostIfName}}
+
+	link.Alias = ownershipAlias(hostIfName)
+	ownership, err := ownedRXFlow(link, hostIfName)
+	require.NoError(t, err)
+	require.Nil(t, ownership)
+
+	link.Alias = rxFlowOwnershipAlias(hostIfName, rxFlowOwnership{100, testDestinationMAC})
+	ownership, err = ownedRXFlow(link, hostIfName)
+	require.NoError(t, err)
+	require.Equal(t, &rxFlowOwnership{100, testDestinationMAC}, ownership)
+
+	for _, alias := range []string{
+		"",
+		ownershipAlias(hostIfName) + ":invalid:" + testDestinationMAC,
+		ownershipAlias(hostIfName) + ":0100:" + testDestinationMAC,
+		ownershipAlias(hostIfName) + ":100:02:00:00:00:00:FF",
+	} {
+		link.Alias = alias
+		_, err := ownedRXFlow(link, hostIfName)
+		require.ErrorIs(t, err, errUnownedLink)
+	}
+}
+
 func TestSetupAndFree(t *testing.T) {
 	t.Run("leases highest free reserved queue and cleans up", func(t *testing.T) {
 		fake := newFakeNetlink(8, 8, testShareID)
@@ -647,12 +815,25 @@ func TestSetupAndFree(t *testing.T) {
 		require.True(t, prepared.Prepared)
 		require.Equal(t, uint32(6), prepared.PhysicalQueueID)
 		require.Equal(t, uint32(1), prepared.VirtualQueueID)
+		require.Equal(t, testDestinationMAC, prepared.RXFlowDestinationMAC)
+		require.Equal(t, uint32(100), *prepared.RXFlowLocation)
 		require.Equal(t, fake.peerIfName, prepared.KernelIfName())
 		require.Equal(t, 1, fake.addCalls)
 		require.Len(t, fake.createRequests, 1)
 		require.Equal(t, uint32(6), fake.createRequests[0].Lease.Queue.ID)
 		require.Equal(t, testPeerIndex, fake.createRequests[0].IfIndex)
-		require.Equal(t, ownershipAlias(fake.hostIfName), fake.links[fake.hostIfName].Attrs().Alias)
+		require.Len(t, fake.flowInsertRequests, 1)
+		require.Equal(t, uint32(6), fake.flowInsertRequests[0].Queue)
+		require.Equal(t, uint32(netlink.RX_CLS_LOC_ANY), fake.flowInsertRequests[0].Location)
+		flow, ok := fake.flowInsertRequests[0].Match.(netlink.EtherFlow)
+		require.True(t, ok)
+		destinationMAC, err := net.ParseMAC(testDestinationMAC)
+		require.NoError(t, err)
+		require.Equal(t, destinationMAC, flow.DstMAC)
+		require.Equal(t, net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, flow.DstMACMask)
+		require.Contains(t, fake.flows, uint32(100))
+		require.Equal(t, rxFlowOwnershipAlias(fake.hostIfName, rxFlowOwnership{100, testDestinationMAC}),
+			fake.links[fake.hostIfName].Attrs().Alias)
 		require.Equal(t, ownershipAlias(fake.peerIfName), fake.links[fake.peerIfName].Attrs().Alias)
 		require.Equal(t, netlink.NETKIT_MODE_L2, fake.addedNetkit.Mode)
 		require.Equal(t, netlink.NETKIT_POLICY_FORWARD, fake.addedNetkit.Policy)
@@ -665,6 +846,8 @@ func TestSetupAndFree(t *testing.T) {
 		require.Equal(t, 1, fake.deleteCalls)
 		require.NotContains(t, fake.links, fake.hostIfName)
 		require.NotContains(t, fake.leases, uint32(6))
+		require.Empty(t, fake.flows)
+		require.Equal(t, []uint32{100}, fake.flowDeleteRequests)
 	})
 
 	t.Run("busy queue race falls through to next queue", func(t *testing.T) {
@@ -703,6 +886,61 @@ func TestSetupAndFree(t *testing.T) {
 		require.Equal(t, 1, fake.deleteCalls)
 	})
 
+	t.Run("flow insertion failure rolls back lease and netkit pair", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.flowInsertError = unix.EOPNOTSUPP
+		fake.install(t)
+
+		_, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.ErrorIs(t, err, unix.EOPNOTSUPP)
+		require.Equal(t, 1, fake.deleteCalls)
+		require.NotContains(t, fake.links, fake.hostIfName)
+		require.Empty(t, fake.leases)
+		require.Empty(t, fake.flows)
+		require.Empty(t, fake.flowDeleteRequests)
+	})
+
+	t.Run("flow ownership failure rolls back rule lease and netkit pair", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.flowAliasError = unix.EIO
+		fake.install(t)
+
+		_, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.ErrorIs(t, err, unix.EIO)
+		require.Equal(t, []uint32{100}, fake.flowDeleteRequests)
+		require.Equal(t, 1, fake.deleteCalls)
+		require.NotContains(t, fake.links, fake.hostIfName)
+		require.Empty(t, fake.leases)
+		require.Empty(t, fake.flows)
+	})
+
+	t.Run("missing inserted flow rolls back rule lease and netkit pair", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.ignoreFlowInsert = true
+		fake.install(t)
+
+		_, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.ErrorContains(t, err, "was not present after insertion")
+		require.Equal(t, []uint32{100}, fake.flowDeleteRequests)
+		require.Equal(t, 1, fake.deleteCalls)
+		require.NotContains(t, fake.links, fake.hostIfName)
+		require.Empty(t, fake.leases)
+		require.Empty(t, fake.flows)
+	})
+
+	t.Run("flow verification failure rolls back rule lease and netkit pair", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.flowListError = unix.EIO
+		fake.install(t)
+
+		_, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.ErrorIs(t, err, unix.EIO)
+		require.Equal(t, []uint32{100}, fake.flowDeleteRequests)
+		require.Equal(t, 1, fake.deleteCalls)
+		require.Empty(t, fake.leases)
+		require.Empty(t, fake.flows)
+	})
+
 	t.Run("adopts an existing lease on retry", func(t *testing.T) {
 		fake := newFakeNetlink(8, 8, testShareID)
 		fake.links[fake.hostIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
@@ -727,6 +965,10 @@ func TestSetupAndFree(t *testing.T) {
 		require.Equal(t, uint32(1), prepared.VirtualQueueID)
 		require.Zero(t, fake.addCalls)
 		require.Empty(t, fake.createRequests)
+		require.Len(t, fake.flowInsertRequests, 1)
+		require.Equal(t, uint32(100), *prepared.RXFlowLocation)
+		require.Contains(t, fake.flows, uint32(100))
+		require.Equal(t, rxFlowOwnershipAlias(fake.hostIfName, rxFlowOwnership{100, testDestinationMAC}), fake.links[fake.hostIfName].Attrs().Alias)
 	})
 
 	t.Run("completes ownership of an existing lease on retry", func(t *testing.T) {
@@ -752,6 +994,82 @@ func TestSetupAndFree(t *testing.T) {
 		require.Equal(t, ownershipAlias(fake.peerIfName), fake.links[fake.peerIfName].Attrs().Alias)
 		require.Zero(t, fake.addCalls)
 		require.Zero(t, fake.deleteCalls)
+		require.Len(t, fake.flowInsertRequests, 1)
+	})
+
+	t.Run("adopts an existing flow without inserting another", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.links[fake.hostIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+			Name: fake.hostIfName, Index: testHostIndex,
+			Alias: rxFlowOwnershipAlias(fake.hostIfName, rxFlowOwnership{100, testDestinationMAC}),
+		}}
+		fake.links[fake.peerIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+			Name: fake.peerIfName, Index: testPeerIndex, Alias: ownershipAlias(fake.peerIfName),
+		}}
+		fake.leases[7] = &netlink.NetDevQueueLease{
+			IfIndex: testPeerIndex,
+			Queue:   netlink.NetDevQueueID{ID: 1, Type: netlink.NetDevQueueTypeRx},
+		}
+		fake.flows[100] = testRXFlow(7, 100)
+		fake.install(t)
+
+		device, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.NoError(t, err)
+		prepared := device.(*RXQueueDevice)
+		require.Equal(t, uint32(7), prepared.PhysicalQueueID)
+		require.Equal(t, uint32(100), *prepared.RXFlowLocation)
+		require.Empty(t, fake.flowInsertRequests)
+		require.Empty(t, fake.flowDeleteRequests)
+		require.Zero(t, fake.addCalls)
+	})
+
+	t.Run("recreates a missing owned flow", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.nextFlowLocation = 101
+		fake.links[fake.hostIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+			Name: fake.hostIfName, Index: testHostIndex,
+			Alias: rxFlowOwnershipAlias(fake.hostIfName, rxFlowOwnership{100, testDestinationMAC}),
+		}}
+		fake.links[fake.peerIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+			Name: fake.peerIfName, Index: testPeerIndex, Alias: ownershipAlias(fake.peerIfName),
+		}}
+		fake.leases[7] = &netlink.NetDevQueueLease{
+			IfIndex: testPeerIndex,
+			Queue:   netlink.NetDevQueueID{ID: 1, Type: netlink.NetDevQueueTypeRx},
+		}
+		fake.install(t)
+
+		device, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.NoError(t, err)
+		prepared := device.(*RXQueueDevice)
+		require.Equal(t, uint32(101), *prepared.RXFlowLocation)
+		require.Len(t, fake.flowInsertRequests, 1)
+		require.Contains(t, fake.flows, uint32(101))
+		require.Equal(t, rxFlowOwnershipAlias(fake.hostIfName, rxFlowOwnership{101, testDestinationMAC}), fake.links[fake.hostIfName].Attrs().Alias)
+	})
+
+	t.Run("refuses owned flow for a different destination", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		const otherDestinationMAC = "02:00:00:00:00:03"
+		fake.links[fake.hostIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+			Name: fake.hostIfName, Index: testHostIndex,
+			Alias: rxFlowOwnershipAlias(fake.hostIfName, rxFlowOwnership{100, otherDestinationMAC}),
+		}}
+		fake.links[fake.peerIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+			Name: fake.peerIfName, Index: testPeerIndex, Alias: ownershipAlias(fake.peerIfName),
+		}}
+		fake.leases[7] = &netlink.NetDevQueueLease{
+			IfIndex: testPeerIndex,
+			Queue:   netlink.NetDevQueueID{ID: 1, Type: netlink.NetDevQueueTypeRx},
+		}
+		fake.flows[100] = testRXFlow(7, 100)
+		fake.install(t)
+
+		_, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.ErrorIs(t, err, errInvalidAllocation)
+		require.Empty(t, fake.flowInsertRequests)
+		require.Empty(t, fake.flowDeleteRequests)
+		require.Zero(t, fake.deleteCalls)
 	})
 
 	t.Run("replaces an incomplete owned pair on retry", func(t *testing.T) {
@@ -771,6 +1089,51 @@ func TestSetupAndFree(t *testing.T) {
 		require.Equal(t, 1, fake.addCalls)
 	})
 
+	t.Run("deletes an owned flow before replacing an incomplete pair", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.nextFlowLocation = 101
+		fake.links[fake.hostIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+			Name: fake.hostIfName, Index: testHostIndex,
+			Alias: rxFlowOwnershipAlias(fake.hostIfName, rxFlowOwnership{100, testDestinationMAC}),
+		}}
+		fake.links[fake.peerIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+			Name: fake.peerIfName, Index: testPeerIndex, Alias: ownershipAlias(fake.peerIfName),
+		}}
+		fake.flows[100] = testRXFlow(7, 100)
+		fake.install(t)
+
+		device, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.NoError(t, err)
+		prepared := device.(*RXQueueDevice)
+		require.Equal(t, uint32(101), *prepared.RXFlowLocation)
+		require.Equal(t, []uint32{100}, fake.flowDeleteRequests)
+		require.NotContains(t, fake.flows, uint32(100))
+		require.Contains(t, fake.flows, uint32(101))
+		require.Equal(t, 1, fake.deleteCalls)
+		require.Equal(t, 1, fake.addCalls)
+	})
+
+	t.Run("preserves an incomplete pair when flow cleanup fails", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.links[fake.hostIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+			Name: fake.hostIfName, Index: testHostIndex,
+			Alias: rxFlowOwnershipAlias(fake.hostIfName, rxFlowOwnership{100, testDestinationMAC}),
+		}}
+		fake.links[fake.peerIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+			Name: fake.peerIfName, Index: testPeerIndex, Alias: ownershipAlias(fake.peerIfName),
+		}}
+		fake.flows[100] = testRXFlow(7, 100)
+		fake.flowDeleteError = unix.EIO
+		fake.install(t)
+
+		_, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.ErrorIs(t, err, unix.EIO)
+		require.Contains(t, fake.links, fake.hostIfName)
+		require.Contains(t, fake.flows, uint32(100))
+		require.Zero(t, fake.deleteCalls)
+		require.Zero(t, fake.addCalls)
+	})
+
 	t.Run("refuses an existing unowned link", func(t *testing.T) {
 		fake := newFakeNetlink(8, 8, testShareID)
 		fake.links[fake.hostIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
@@ -787,10 +1150,74 @@ func TestSetupAndFree(t *testing.T) {
 		fake := newFakeNetlink(8, 8, testShareID)
 		fake.install(t)
 
-		prepared := testDevice(8).prepared("wrong-host", "wrong-peer", 7, 1)
+		prepared := testDevice(8).prepared("wrong-host", "wrong-peer", 7, 1, testDestinationMAC, 100)
 		_, err := prepared.Setup(testAllocation(testShareID))
 		require.ErrorIs(t, err, errInvalidAllocation)
 		require.ErrorIs(t, prepared.Free(testAllocation(testShareID)), errInvalidAllocation)
+		require.Zero(t, fake.deleteCalls)
+	})
+
+	t.Run("flow deletion failure preserves the lease for retry", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.install(t)
+
+		device, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.NoError(t, err)
+		prepared := device.(*RXQueueDevice)
+		fake.flowDeleteError = unix.EIO
+
+		err = prepared.Free(testAllocation(testShareID))
+		require.ErrorIs(t, err, unix.EIO)
+		require.Contains(t, fake.links, fake.hostIfName)
+		require.Contains(t, fake.leases, prepared.PhysicalQueueID)
+		require.Contains(t, fake.flows, *prepared.RXFlowLocation)
+		require.Zero(t, fake.deleteCalls)
+
+		fake.flowDeleteError = nil
+		require.NoError(t, prepared.Free(testAllocation(testShareID)))
+		require.NotContains(t, fake.links, fake.hostIfName)
+		require.Empty(t, fake.flows)
+	})
+
+	t.Run("failed flow deletion readback preserves the lease for retry", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.install(t)
+
+		device, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.NoError(t, err)
+		prepared := device.(*RXQueueDevice)
+		fake.ignoreFlowDelete = true
+
+		err = prepared.Free(testAllocation(testShareID))
+		require.ErrorContains(t, err, "remained after deletion")
+		require.Contains(t, fake.links, fake.hostIfName)
+		require.Contains(t, fake.leases, prepared.PhysicalQueueID)
+		require.Contains(t, fake.flows, *prepared.RXFlowLocation)
+		require.Zero(t, fake.deleteCalls)
+
+		fake.ignoreFlowDelete = false
+		require.NoError(t, prepared.Free(testAllocation(testShareID)))
+		require.NotContains(t, fake.links, fake.hostIfName)
+		require.Empty(t, fake.flows)
+	})
+
+	t.Run("flow metadata mismatch refuses cleanup", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.install(t)
+
+		device, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.NoError(t, err)
+		prepared := device.(*RXQueueDevice)
+		fake.links[fake.hostIfName].Attrs().Alias = rxFlowOwnershipAlias(
+			fake.hostIfName, rxFlowOwnership{101, testDestinationMAC},
+		)
+
+		err = prepared.Free(testAllocation(testShareID))
+		require.ErrorIs(t, err, errUnownedLink)
+		require.Contains(t, fake.links, fake.hostIfName)
+		require.Contains(t, fake.leases, prepared.PhysicalQueueID)
+		require.Contains(t, fake.flows, *prepared.RXFlowLocation)
+		require.Empty(t, fake.flowDeleteRequests)
 		require.Zero(t, fake.deleteCalls)
 	})
 }
@@ -806,7 +1233,7 @@ func TestDeviceMetadataAndSerialization(t *testing.T) {
 		Drivers: []string{"ice"},
 	}))
 
-	prepared := advertised.prepared("zrxh12345678901", "zrxp12345678901", 15, 1)
+	prepared := advertised.prepared("zrxh12345678901", "zrxp12345678901", 15, 1, testDestinationMAC, 100)
 	attrs := prepared.GetAttrs()
 	require.EqualValues(t, 1, *attrs[types.RXQueueIDLabel].IntValue)
 	require.Equal(t, prepared.PhysicalIfName, *attrs[types.IfNameLabel].StringValue)
@@ -824,6 +1251,87 @@ func TestDeviceMetadataAndSerialization(t *testing.T) {
 	require.Equal(t, prepared.PeerIfName, restored.PeerIfName)
 	require.Equal(t, prepared.PhysicalQueueID, restored.PhysicalQueueID)
 	require.Equal(t, prepared.VirtualQueueID, restored.VirtualQueueID)
+	require.Equal(t, prepared.RXFlowDestinationMAC, restored.RXFlowDestinationMAC)
+	require.Equal(t, prepared.RXFlowLocation, restored.RXFlowLocation)
+	require.NotSame(t, prepared.RXFlowLocation, restored.RXFlowLocation)
+	*restored.RXFlowLocation = 101
+	require.Equal(t, uint32(100), *prepared.RXFlowLocation)
+}
+
+func TestDeviceStateRXFlowValidation(t *testing.T) {
+	location := uint32(100)
+	valid := deviceState{
+		PhysicalIfName:       testPhysicalIfName,
+		TotalRXQueues:        8,
+		ReservedQueueIDs:     []uint32{7},
+		Prepared:             true,
+		HostIfName:           "zrxh12345678901",
+		PeerIfName:           "zrxp12345678901",
+		PhysicalQueueID:      7,
+		VirtualQueueID:       1,
+		RXFlowDestinationMAC: testDestinationMAC,
+		RXFlowLocation:       &location,
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*deviceState)
+	}{
+		{
+			name: "missing destination MAC",
+			mutate: func(state *deviceState) {
+				state.RXFlowDestinationMAC = ""
+			},
+		},
+		{
+			name: "missing location",
+			mutate: func(state *deviceState) {
+				state.RXFlowLocation = nil
+			},
+		},
+		{
+			name: "unprepared",
+			mutate: func(state *deviceState) {
+				state.Prepared = false
+			},
+		},
+		{
+			name: "invalid destination MAC",
+			mutate: func(state *deviceState) {
+				state.RXFlowDestinationMAC = "not-a-mac"
+			},
+		},
+		{
+			name: "non-canonical destination MAC",
+			mutate: func(state *deviceState) {
+				state.RXFlowDestinationMAC = "02:00:00:00:00:AB"
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := valid
+			tt.mutate(&state)
+			data, err := json.Marshal(state)
+			require.NoError(t, err)
+
+			err = (&RXQueueDevice{}).UnmarshalBinary(data)
+			require.Error(t, err)
+		})
+	}
+
+	t.Run("accepts state written before flow steering", func(t *testing.T) {
+		state := valid
+		state.RXFlowDestinationMAC = ""
+		state.RXFlowLocation = nil
+		data, err := json.Marshal(state)
+		require.NoError(t, err)
+
+		restored := &RXQueueDevice{}
+		require.NoError(t, restored.UnmarshalBinary(data))
+		require.Empty(t, restored.RXFlowDestinationMAC)
+		require.Nil(t, restored.RXFlowLocation)
+	})
 }
 
 func TestValidateAllocation(t *testing.T) {

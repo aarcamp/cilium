@@ -24,6 +24,7 @@ import (
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/networkdriver/dummy"
+	"github.com/cilium/cilium/pkg/networkdriver/rxqueue"
 	"github.com/cilium/cilium/pkg/networkdriver/types"
 	"github.com/cilium/cilium/pkg/option"
 )
@@ -68,6 +69,31 @@ func TestSerializeDevice(t *testing.T) {
 		dummyMgr, err := newDummyManager(t)
 		require.NoError(t, err)
 		restored, err := dummyMgr.RestoreDevice(serialized.Dev)
+		require.NoError(t, err)
+		require.Equal(t, dev.IfName(), restored.IfName())
+	})
+
+	t.Run("RX queue device round-trip", func(t *testing.T) {
+		dev := &rxqueue.RXQueueDevice{
+			PhysicalIfName:   "eth0",
+			TotalRXQueues:    8,
+			ReservedQueueIDs: []uint32{7, 6},
+		}
+		capacity := map[resourceapi.QualifiedName]apiresource.Quantity{
+			types.RXQueuesCapacity: apiresource.MustParse("1"),
+		}
+		a := allocation{Device: dev, Manager: types.DeviceManagerTypeRXQueue, ConsumedCapacity: capacity}
+
+		raw, err := serializeDevice(a)
+		require.NoError(t, err)
+
+		serialized, err := deserializeDevice(raw)
+		require.NoError(t, err)
+		require.Equal(t, types.DeviceManagerTypeRXQueue, serialized.Manager)
+		require.Equal(t, capacity, serialized.ConsumedCapacity)
+
+		mgr := &rxqueue.RXQueueManager{}
+		restored, err := mgr.RestoreDevice(serialized.Dev)
 		require.NoError(t, err)
 		require.Equal(t, dev.IfName(), restored.IfName())
 	})

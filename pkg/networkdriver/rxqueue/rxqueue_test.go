@@ -43,29 +43,36 @@ func publishedDevices(t *testing.T, mgr *RXQueueManager) []types.Device {
 }
 
 type fakeNetlink struct {
-	links            map[string]netlink.Link
-	leases           map[uint32]*netlink.NetDevQueueLease
-	addedNetkit      *netlink.Netkit
-	createErrors     map[uint32]error
-	createRequests   []netlink.NetDevQueueCreateRequest
-	realRXQueues     int
-	rss              netlink.NetDevRSS
-	rings            netlink.NetDevRings
-	rssSetCalls      []netlink.NetDevRSSConfig
-	ringsSetCalls    []netlink.NetDevRingsConfig
-	rssSetError      error
-	ringsSetError    error
-	ignoreRSSSet     bool
-	ignoreRingsSet   bool
-	hostIfName       string
-	peerIfName       string
-	addCalls         int
-	deleteCalls      int
-	flows            map[uint32]netlink.NetDevRxFlow
-	flowInsertCalls  []netlink.NetDevRxFlow
-	flowDeleteCalls  []uint32
-	flowInsertErrors map[int]error
-	nextFlowLocation uint32
+	links                map[string]netlink.Link
+	leases               map[uint32]*netlink.NetDevQueueLease
+	addedNetkit          *netlink.Netkit
+	createErrors         map[uint32]error
+	createRequests       []netlink.NetDevQueueCreateRequest
+	realRXQueues         int
+	rss                  netlink.NetDevRSS
+	rings                netlink.NetDevRings
+	features             map[string]netlink.NetDevFeature
+	rssSetCalls          []netlink.NetDevRSSConfig
+	ringsSetCalls        []netlink.NetDevRingsConfig
+	featureSetCalls      []map[string]bool
+	rssSetError          error
+	ringsSetError        error
+	featuresGetError     error
+	featuresSetError     error
+	ignoreRSSSet         bool
+	ignoreRingsSet       bool
+	ignoreFeaturesSet    bool
+	hostIfName           string
+	peerIfName           string
+	addCalls             int
+	deleteCalls          int
+	flows                map[uint32]netlink.NetDevRxFlow
+	flowInsertCalls      []netlink.NetDevRxFlow
+	flowDeleteCalls      []uint32
+	flowInsertErrors     map[int]error
+	flowAnyLocationError error
+	flowListError        error
+	nextFlowLocation     uint32
 }
 
 func newFakeNetlink(maxRXQueues, realRXQueues int, shareID kube_types.UID) *fakeNetlink {
@@ -89,6 +96,7 @@ func newFakeNetlink(maxRXQueues, realRXQueues int, shareID kube_types.UID) *fake
 		},
 		leases:           make(map[uint32]*netlink.NetDevQueueLease),
 		createErrors:     make(map[uint32]error),
+		features:         make(map[string]netlink.NetDevFeature),
 		flows:            make(map[uint32]netlink.NetDevRxFlow),
 		flowInsertErrors: make(map[int]error),
 		nextFlowLocation: 100,
@@ -126,6 +134,8 @@ func (f *fakeNetlink) install(t *testing.T) {
 	originalRSSSet := netlinkNetDevRSSSet
 	originalRingsGet := netlinkNetDevRingsGet
 	originalRingsSet := netlinkNetDevRingsSet
+	originalFeaturesGet := netlinkNetDevFeaturesGet
+	originalFeaturesSet := netlinkNetDevFeaturesSet
 	originalFlowInsert := netlinkNetDevRxFlowInsert
 	originalFlowDelete := netlinkNetDevRxFlowDelete
 	originalFlowList := netlinkNetDevRxFlowList
@@ -142,6 +152,8 @@ func (f *fakeNetlink) install(t *testing.T) {
 		netlinkNetDevRingsGet = originalRingsGet
 		netlinkNetDevRingsSet = originalRingsSet
 		netlinkNetDevRxFlowInsert = originalFlowInsert
+		netlinkNetDevFeaturesGet = originalFeaturesGet
+		netlinkNetDevFeaturesSet = originalFeaturesSet
 		netlinkNetDevRxFlowDelete = originalFlowDelete
 		netlinkNetDevRxFlowList = originalFlowList
 	})
@@ -272,6 +284,48 @@ func (f *fakeNetlink) install(t *testing.T) {
 		if !f.ignoreRingsSet && config.TCPDataSplit != nil {
 			f.rings.TCPDataSplit = *config.TCPDataSplit
 		}
+		if !f.ignoreRingsSet && config.HDSThreshold != nil {
+			f.rings.HDSThreshold = *config.HDSThreshold
+		}
+		return nil
+	}
+	netlinkNetDevFeaturesGet = func(ifIndex int) (map[string]netlink.NetDevFeature, error) {
+		if ifIndex != testPhysicalIndex {
+			return nil, unix.ENODEV
+		}
+		if f.featuresGetError != nil {
+			return nil, f.featuresGetError
+		}
+		features := make(map[string]netlink.NetDevFeature, len(f.features))
+		for name, feature := range f.features {
+			features[name] = feature
+		}
+		return features, nil
+	}
+	netlinkNetDevFeaturesSet = func(ifIndex int, config map[string]bool) error {
+		if ifIndex != testPhysicalIndex {
+			return unix.ENODEV
+		}
+		request := make(map[string]bool, len(config))
+		for name, wanted := range config {
+			request[name] = wanted
+		}
+		f.featureSetCalls = append(f.featureSetCalls, request)
+		if f.featuresSetError != nil {
+			return f.featuresSetError
+		}
+		if f.ignoreFeaturesSet {
+			return nil
+		}
+		for name, wanted := range config {
+			feature, ok := f.features[name]
+			if !ok {
+				return unix.EINVAL
+			}
+			feature.Wanted = wanted
+			feature.Active = wanted
+			f.features[name] = feature
+		}
 		return nil
 	}
 	netlinkNetDevRxFlowInsert = func(ifName string, flow netlink.NetDevRxFlow) (uint32, error) {
@@ -281,6 +335,9 @@ func (f *fakeNetlink) install(t *testing.T) {
 		f.flowInsertCalls = append(f.flowInsertCalls, flow)
 		if err := f.flowInsertErrors[len(f.flowInsertCalls)]; err != nil {
 			return 0, err
+		}
+		if flow.Location == netlink.RX_CLS_LOC_ANY && f.flowAnyLocationError != nil {
+			return 0, f.flowAnyLocationError
 		}
 		location := flow.Location
 		if location == netlink.RX_CLS_LOC_ANY {
@@ -302,6 +359,9 @@ func (f *fakeNetlink) install(t *testing.T) {
 	netlinkNetDevRxFlowList = func(ifName string) ([]uint32, error) {
 		if ifName != testPhysicalIfName {
 			return nil, unix.ENODEV
+		}
+		if f.flowListError != nil {
+			return nil, f.flowListError
 		}
 		locations := make([]uint32, 0, len(f.flows))
 		for location := range f.flows {
@@ -524,6 +584,7 @@ func TestNewManager(t *testing.T) {
 		fake := newFakeNetlink(8, 4, testShareID)
 		fake.rss.IndirectionTable = []uint32{0, 3, 1, 3, 2, 3}
 		originalHashKey := slices.Clone(fake.rss.HashKey)
+		fake.featuresGetError = errors.New("unexpected feature query")
 		fake.install(t)
 
 		_, err := NewManager(hivetest.Logger(t), &v2alpha1.RXQueueDeviceManagerConfig{
@@ -549,6 +610,175 @@ func TestNewManager(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, fake.rssSetCalls)
 		require.Empty(t, fake.ringsSetCalls)
+	})
+
+	t.Run("sets a zero HDS threshold when TCP data splitting is already enabled", func(t *testing.T) {
+		fake := newFakeNetlink(8, 4, testShareID)
+		fake.rss.IndirectionTable = []uint32{0, 1, 2, 0}
+		fake.rings.TCPDataSplit = netlink.NetDevTCPDataSplitEnabled
+		fake.rings.HDSThreshold = 128
+		fake.install(t)
+
+		_, err := NewManager(hivetest.Logger(t), &v2alpha1.RXQueueDeviceManagerConfig{
+			Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: testPhysicalIfName}},
+		})
+		require.NoError(t, err)
+		require.Zero(t, fake.rings.HDSThreshold)
+		require.Len(t, fake.ringsSetCalls, 1)
+	})
+
+	t.Run("enables hardware GRO before TCP data splitting when the ring setting is unavailable", func(t *testing.T) {
+		fake := newFakeNetlink(8, 4, testShareID)
+		fake.rss.IndirectionTable = []uint32{0, 3, 1, 3, 2, 3}
+		fake.rings.TCPDataSplit = netlink.NetDevTCPDataSplitUnknown
+		fake.features[hardwareGROFeature] = netlink.NetDevFeature{Hardware: true}
+		fake.install(t)
+
+		_, err := NewManager(hivetest.Logger(t), &v2alpha1.RXQueueDeviceManagerConfig{
+			Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: testPhysicalIfName}},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []uint32{0, 0, 1, 1, 2, 2}, fake.rss.IndirectionTable)
+		require.Equal(t, netlink.NetDevFeature{Hardware: true, Wanted: true, Active: true}, fake.features[hardwareGROFeature])
+		require.Equal(t, netlink.NetDevTCPDataSplitEnabled, fake.rings.TCPDataSplit)
+		require.Zero(t, fake.rings.HDSThreshold)
+		require.Len(t, fake.rssSetCalls, 1)
+		require.Equal(t, []map[string]bool{{hardwareGROFeature: true}}, fake.featureSetCalls)
+		require.Len(t, fake.ringsSetCalls, 1)
+		require.NotNil(t, fake.ringsSetCalls[0].HDSThreshold)
+	})
+
+	t.Run("enables TCP data splitting with active hardware GRO", func(t *testing.T) {
+		fake := newFakeNetlink(8, 4, testShareID)
+		fake.rss.IndirectionTable = []uint32{0, 1, 2, 0}
+		fake.rings.TCPDataSplit = netlink.NetDevTCPDataSplitUnknown
+		fake.features[hardwareGROFeature] = netlink.NetDevFeature{
+			Hardware: true,
+			Wanted:   true,
+			Active:   true,
+		}
+		fake.install(t)
+
+		_, err := NewManager(hivetest.Logger(t), &v2alpha1.RXQueueDeviceManagerConfig{
+			Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: testPhysicalIfName}},
+		})
+		require.NoError(t, err)
+		require.Empty(t, fake.rssSetCalls)
+		require.Len(t, fake.ringsSetCalls, 1)
+		require.Empty(t, fake.featureSetCalls)
+	})
+
+	t.Run("rejects unavailable hardware GRO before writing", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			feature netlink.NetDevFeature
+		}{
+			{
+				name: "not supported by hardware",
+			},
+			{
+				name: "fixed off",
+				feature: netlink.NetDevFeature{
+					Hardware: true,
+					NoChange: true,
+				},
+			},
+			{
+				name: "requested but inactive",
+				feature: netlink.NetDevFeature{
+					Hardware: true,
+					Wanted:   true,
+				},
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				fake := newFakeNetlink(8, 4, testShareID)
+				fake.rings.TCPDataSplit = netlink.NetDevTCPDataSplitUnknown
+				fake.features[hardwareGROFeature] = tt.feature
+				fake.install(t)
+
+				_, err := NewManager(hivetest.Logger(t), &v2alpha1.RXQueueDeviceManagerConfig{
+					Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: testPhysicalIfName}},
+				})
+				require.ErrorIs(t, err, unix.EOPNOTSUPP)
+				require.Empty(t, fake.rssSetCalls)
+				require.Empty(t, fake.ringsSetCalls)
+				require.Empty(t, fake.featureSetCalls)
+			})
+		}
+	})
+
+	t.Run("restores RSS when enabling hardware GRO fails", func(t *testing.T) {
+		fake := newFakeNetlink(8, 4, testShareID)
+		fake.rss.IndirectionTable = []uint32{0, 3, 1, 3, 2, 3}
+		fake.rings.TCPDataSplit = netlink.NetDevTCPDataSplitUnknown
+		fake.features[hardwareGROFeature] = netlink.NetDevFeature{Hardware: true}
+		originalRSS := cloneNetDevRSS(&fake.rss)
+		boom := errors.New("feature update failed")
+		fake.featuresSetError = boom
+		fake.install(t)
+
+		_, err := NewManager(hivetest.Logger(t), &v2alpha1.RXQueueDeviceManagerConfig{
+			Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: testPhysicalIfName}},
+		})
+		require.ErrorIs(t, err, boom)
+		require.True(t, equalNetDevRSS(originalRSS, &fake.rss))
+		require.Equal(t, netlink.NetDevFeature{Hardware: true}, fake.features[hardwareGROFeature])
+		require.Len(t, fake.rssSetCalls, 2)
+		require.Equal(t, []map[string]bool{{hardwareGROFeature: true}}, fake.featureSetCalls)
+		require.Empty(t, fake.ringsSetCalls)
+	})
+
+	t.Run("restores hardware GRO and RSS when enabling TCP data splitting fails", func(t *testing.T) {
+		fake := newFakeNetlink(8, 4, testShareID)
+		fake.rss.IndirectionTable = []uint32{0, 3, 1, 3, 2, 3}
+		fake.rings.TCPDataSplit = netlink.NetDevTCPDataSplitUnknown
+		originalFeature := netlink.NetDevFeature{Hardware: true}
+		fake.features[hardwareGROFeature] = originalFeature
+		originalRSS := cloneNetDevRSS(&fake.rss)
+		boom := errors.New("ring update failed")
+		fake.ringsSetError = boom
+		fake.install(t)
+
+		_, err := NewManager(hivetest.Logger(t), &v2alpha1.RXQueueDeviceManagerConfig{
+			Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: testPhysicalIfName}},
+		})
+		require.ErrorIs(t, err, boom)
+		require.True(t, equalNetDevRSS(originalRSS, &fake.rss))
+		require.Equal(t, originalFeature, fake.features[hardwareGROFeature])
+		require.Equal(t, netlink.NetDevTCPDataSplitUnknown, fake.rings.TCPDataSplit)
+		require.Len(t, fake.rssSetCalls, 2)
+		require.Equal(t, []map[string]bool{
+			{hardwareGROFeature: true},
+			{hardwareGROFeature: false},
+		}, fake.featureSetCalls)
+		require.Len(t, fake.ringsSetCalls, 1)
+	})
+
+	t.Run("restores hardware GRO and RSS when feature readback does not match", func(t *testing.T) {
+		fake := newFakeNetlink(8, 4, testShareID)
+		fake.rss.IndirectionTable = []uint32{0, 3, 1, 3, 2, 3}
+		fake.rings.TCPDataSplit = netlink.NetDevTCPDataSplitUnknown
+		originalFeature := netlink.NetDevFeature{Hardware: true}
+		fake.features[hardwareGROFeature] = originalFeature
+		originalRSS := cloneNetDevRSS(&fake.rss)
+		fake.ignoreFeaturesSet = true
+		fake.install(t)
+
+		_, err := NewManager(hivetest.Logger(t), &v2alpha1.RXQueueDeviceManagerConfig{
+			Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: testPhysicalIfName}},
+		})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "hardware GRO read back incorrectly")
+		require.True(t, equalNetDevRSS(originalRSS, &fake.rss))
+		require.Equal(t, originalFeature, fake.features[hardwareGROFeature])
+		require.Len(t, fake.rssSetCalls, 2)
+		require.Equal(t, []map[string]bool{
+			{hardwareGROFeature: true},
+			{hardwareGROFeature: false},
+		}, fake.featureSetCalls)
+		require.Len(t, fake.ringsSetCalls, 2)
 	})
 
 	t.Run("requires TCP data splitting support before writing", func(t *testing.T) {

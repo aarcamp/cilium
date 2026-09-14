@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/cilium/cilium/pkg/networkdriver/types"
@@ -143,4 +144,47 @@ func TestRecoverRXQueueFlows(t *testing.T) {
 	require.NoError(t, recovered.Free(testAllocation(testShareID)))
 	require.Empty(t, fake.flows)
 	require.NotContains(t, fake.links, fake.hostIfName)
+}
+
+func TestInsertRXFlowExplicitLocationFallback(t *testing.T) {
+	for _, driverErr := range []error{unix.EINVAL, unix.ENOSPC} {
+		t.Run(driverErr.Error(), func(t *testing.T) {
+			fake := newFakeNetlink(8, 8, testShareID)
+			fake.flowAnyLocationError = driverErr
+			fake.flows[0] = netlink.NetDevRxFlow{Location: 0}
+			fake.flows[2] = netlink.NetDevRxFlow{Location: 2}
+			fake.install(t)
+
+			location, err := insertRXFlow(testPhysicalIfName, netlink.NetDevRxFlow{
+				Match:    netlink.TCP4Flow{},
+				Queue:    7,
+				Location: netlink.RX_CLS_LOC_ANY,
+			})
+			require.NoError(t, err)
+			require.Equal(t, uint32(1), location)
+			require.Len(t, fake.flowInsertCalls, 2)
+			require.Equal(t, uint32(netlink.RX_CLS_LOC_ANY), fake.flowInsertCalls[0].Location)
+			require.Equal(t, uint32(1), fake.flowInsertCalls[1].Location)
+			require.Contains(t, fake.flows, uint32(0))
+			require.Contains(t, fake.flows, uint32(1))
+			require.Contains(t, fake.flows, uint32(2))
+		})
+	}
+}
+
+func TestInsertRXFlowExplicitLocationListFailure(t *testing.T) {
+	fake := newFakeNetlink(8, 8, testShareID)
+	fake.flowAnyLocationError = unix.ENOSPC
+	fake.flowListError = unix.EIO
+	fake.install(t)
+
+	_, err := insertRXFlow(testPhysicalIfName, netlink.NetDevRxFlow{
+		Match:    netlink.TCP4Flow{},
+		Queue:    7,
+		Location: netlink.RX_CLS_LOC_ANY,
+	})
+	require.ErrorIs(t, err, unix.ENOSPC)
+	require.ErrorIs(t, err, unix.EIO)
+	require.Len(t, fake.flowInsertCalls, 1)
+	require.Empty(t, fake.flows)
 }

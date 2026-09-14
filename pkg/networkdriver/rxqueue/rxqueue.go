@@ -45,17 +45,20 @@ var (
 	errInvalidAllocation    = errors.New("invalid RX queue allocation")
 	errUnownedLink          = errors.New("refusing to use link not owned by the RX queue manager")
 
-	netlinkLinkByName        = safenetlink.LinkByName
-	netlinkLinkAdd           = netlink.LinkAdd
-	netlinkLinkDel           = netlink.LinkDel
-	netlinkLinkSetAlias      = netlink.LinkSetAlias
-	netlinkLinkSetUp         = netlink.LinkSetUp
-	netlinkNetDevQueueGet    = netlink.NetDevQueueGet
-	netlinkNetDevQueueCreate = netlink.NetDevQueueCreate
-	netlinkNetDevRSSGet      = netlink.NetDevRSSGet
-	netlinkNetDevRSSSet      = netlink.NetDevRSSSet
-	netlinkNetDevRingsGet    = netlink.NetDevRingsGet
-	netlinkNetDevRingsSet    = netlink.NetDevRingsSet
+	netlinkLinkByName         = safenetlink.LinkByName
+	netlinkLinkAdd            = netlink.LinkAdd
+	netlinkLinkDel            = netlink.LinkDel
+	netlinkLinkSetAlias       = netlink.LinkSetAlias
+	netlinkLinkSetUp          = netlink.LinkSetUp
+	netlinkNetDevQueueGet     = netlink.NetDevQueueGet
+	netlinkNetDevQueueCreate  = netlink.NetDevQueueCreate
+	netlinkNetDevRSSGet       = netlink.NetDevRSSGet
+	netlinkNetDevRSSSet       = netlink.NetDevRSSSet
+	netlinkNetDevRingsGet     = netlink.NetDevRingsGet
+	netlinkNetDevRingsSet     = netlink.NetDevRingsSet
+	netlinkNetDevRxFlowInsert = netlink.NetDevRxFlowInsert
+	netlinkNetDevRxFlowDelete = netlink.NetDevRxFlowDelete
+	netlinkNetDevRxFlowList   = netlink.NetDevRxFlowList
 )
 
 type RXQueueManager struct {
@@ -441,11 +444,13 @@ type RXQueueDevice struct {
 	TotalRXQueues    int      `json:"totalRXQueues"`
 	ReservedQueueIDs []uint32 `json:"reservedQueueIDs"`
 
-	Prepared        bool   `json:"prepared,omitempty"`
-	HostIfName      string `json:"hostIfName,omitempty"`
-	PeerIfName      string `json:"peerIfName,omitempty"`
-	PhysicalQueueID uint32 `json:"physicalQueueID,omitempty"`
-	VirtualQueueID  uint32 `json:"virtualQueueID,omitempty"`
+	Prepared             bool    `json:"prepared,omitempty"`
+	HostIfName           string  `json:"hostIfName,omitempty"`
+	PeerIfName           string  `json:"peerIfName,omitempty"`
+	PhysicalQueueID      uint32  `json:"physicalQueueID,omitempty"`
+	VirtualQueueID       uint32  `json:"virtualQueueID,omitempty"`
+	RXFlowDestinationMAC string  `json:"rxFlowDestinationMAC,omitempty"`
+	RXFlowLocation       *uint32 `json:"rxFlowLocation,omitempty"`
 
 	mu sync.Mutex
 }
@@ -489,7 +494,7 @@ func (d *RXQueueDevice) Setup(allocation types.DeviceAllocation) (types.Device, 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	return d.setup(allocation, d.ReservedQueueIDs)
+	return d.setup(allocation, d.ReservedQueueIDs, netlink.RX_CLS_LOC_ANY)
 }
 
 func (d *RXQueueDevice) Recover(allocation types.DeviceAllocation) (types.Device, error) {
@@ -504,15 +509,29 @@ func (d *RXQueueDevice) Recover(allocation types.DeviceAllocation) (types.Device
 			errInvalidAllocation, d.PhysicalQueueID)
 	}
 
-	recovered, err := d.setup(allocation, []uint32{d.PhysicalQueueID})
+	flowLocation := uint32(netlink.RX_CLS_LOC_ANY)
+	if d.RXFlowLocation != nil {
+		flowLocation = *d.RXFlowLocation
+	}
+	recovered, err := d.setup(allocation, []uint32{d.PhysicalQueueID}, flowLocation)
 	if err != nil {
 		return nil, err
 	}
+
+	var recoveryErr error
 	if recovered.VirtualQueueID != d.VirtualQueueID {
-		recoveryErr := fmt.Errorf(
+		recoveryErr = fmt.Errorf(
 			"%w: recovered virtual RX queue ID %d does not match stored ID %d",
 			errInvalidAllocation, recovered.VirtualQueueID, d.VirtualQueueID,
 		)
+	} else if d.RXFlowLocation != nil &&
+		(recovered.RXFlowLocation == nil || *recovered.RXFlowLocation != *d.RXFlowLocation) {
+		recoveryErr = fmt.Errorf(
+			"%w: recovered RX flow location does not match stored location %d",
+			errInvalidAllocation, *d.RXFlowLocation,
+		)
+	}
+	if recoveryErr != nil {
 		if cleanupErr := recovered.Free(allocation); cleanupErr != nil {
 			recoveryErr = errors.Join(recoveryErr,
 				fmt.Errorf("failed to clean up recovered RX queue device: %w", cleanupErr))
@@ -526,8 +545,13 @@ func (d *RXQueueDevice) Recover(allocation types.DeviceAllocation) (types.Device
 func (d *RXQueueDevice) setup(
 	allocation types.DeviceAllocation,
 	physicalQueueIDs []uint32,
+	flowLocation uint32,
 ) (*RXQueueDevice, error) {
 	if err := validateAllocation(allocation); err != nil {
+		return nil, err
+	}
+	flow, destinationMAC, err := rxFlowForAllocation(allocation)
+	if err != nil {
 		return nil, err
 	}
 
@@ -535,8 +559,13 @@ func (d *RXQueueDevice) setup(
 	if d.Prepared && (d.HostIfName != hostIfName || d.PeerIfName != peerIfName) {
 		return nil, fmt.Errorf("%w: stored netkit names do not match share ID", errInvalidAllocation)
 	}
+	if d.Prepared && d.RXFlowDestinationMAC != "" && d.RXFlowDestinationMAC != destinationMAC {
+		return nil, fmt.Errorf("%w: stored RX flow destination MAC does not match allocation", errInvalidAllocation)
+	}
 
-	if prepared, exists, err := d.adoptExisting(hostIfName, peerIfName, physicalQueueIDs); err != nil {
+	if prepared, exists, err := d.adoptExisting(
+		hostIfName, peerIfName, physicalQueueIDs, flow, destinationMAC, flowLocation,
+	); err != nil {
 		return nil, err
 	} else if exists {
 		return prepared, nil
@@ -550,7 +579,9 @@ func (d *RXQueueDevice) setup(
 		return nil, fmt.Errorf("physical interface %s is down", d.PhysicalIfName)
 	}
 
-	return d.createLease(physical, hostIfName, peerIfName, physicalQueueIDs)
+	return d.createLease(
+		physical, hostIfName, peerIfName, physicalQueueIDs, flow, destinationMAC, flowLocation,
+	)
 }
 
 func validateAllocation(allocation types.DeviceAllocation) error {
@@ -585,6 +616,9 @@ func ownershipAlias(ifName string) string {
 func (d *RXQueueDevice) adoptExisting(
 	hostIfName, peerIfName string,
 	physicalQueueIDs []uint32,
+	flow netlink.EtherFlow,
+	destinationMAC string,
+	flowLocation uint32,
 ) (*RXQueueDevice, bool, error) {
 	host, err := netlinkLinkByName(hostIfName)
 	if err != nil {
@@ -593,7 +627,8 @@ func (d *RXQueueDevice) adoptExisting(
 		}
 		return nil, false, fmt.Errorf("failed to inspect existing host link %s: %w", hostIfName, err)
 	}
-	if err := validateOwnedNetkit(host, ownershipAlias(hostIfName)); err != nil {
+	flowOwnership, err := ownedRXFlow(host, hostIfName)
+	if err != nil {
 		return nil, true, err
 	}
 
@@ -623,29 +658,38 @@ func (d *RXQueueDevice) adoptExisting(
 			return nil, true, err
 		}
 		if leaseMatches(queue.Lease, peer.Attrs().Index) {
-			return d.prepared(hostIfName, peerIfName, physicalQueueID, queue.Lease.Queue.ID), true, nil
+			location, err := ensureRXFlow(
+				d.PhysicalIfName, physicalQueueID, flow, destinationMAC, host, flowOwnership, flowLocation,
+			)
+			if err != nil {
+				return nil, true, err
+			}
+			return d.prepared(
+				hostIfName, peerIfName, physicalQueueID, queue.Lease.Queue.ID, destinationMAC, location,
+			), true, nil
 		}
 	}
 
 	// A prior setup stopped after creating the pair but before creating its
 	// lease. Remove the manager-owned partial state and let setup start again.
+	if flowOwnership != nil {
+		if err := deleteRXFlowIfExists(d.PhysicalIfName, flowOwnership.location); err != nil {
+			return nil, true, err
+		}
+	}
 	if err := netlinkLinkDel(host); err != nil {
 		return nil, true, fmt.Errorf("failed to clean up incomplete netkit host %s: %w", hostIfName, err)
 	}
 	return nil, false, nil
 }
 
-func validateOwnedNetkit(link netlink.Link, wantAlias string) error {
-	if _, ok := link.(*netlink.Netkit); !ok || link.Attrs().Alias != wantAlias {
-		return fmt.Errorf("%w: %s", errUnownedLink, link.Attrs().Name)
-	}
-	return nil
-}
-
 func (d *RXQueueDevice) createLease(
 	physical netlink.Link,
 	hostIfName, peerIfName string,
 	physicalQueueIDs []uint32,
+	flow netlink.EtherFlow,
+	destinationMAC string,
+	flowLocation uint32,
 ) (prepared *RXQueueDevice, err error) {
 	netkit := &netlink.Netkit{
 		LinkAttrs: netlink.LinkAttrs{
@@ -737,8 +781,17 @@ func (d *RXQueueDevice) createLease(
 				d.PhysicalIfName, physicalQueueID)
 		}
 
+		location, err := ensureRXFlow(
+			d.PhysicalIfName, physicalQueueID, flow, destinationMAC, host, nil, flowLocation,
+		)
+		if err != nil {
+			return nil, err
+		}
+
 		cleanup = false
-		return d.prepared(hostIfName, peerIfName, physicalQueueID, virtualQueueID), nil
+		return d.prepared(
+			hostIfName, peerIfName, physicalQueueID, virtualQueueID, destinationMAC, location,
+		), nil
 	}
 
 	return nil, fmt.Errorf("%w on %s", errNoAvailableRXQueue, d.PhysicalIfName)
@@ -765,18 +818,23 @@ func leaseMatches(lease *netlink.NetDevQueueLease, peerIfIndex int) bool {
 func (d *RXQueueDevice) prepared(
 	hostIfName, peerIfName string,
 	physicalQueueID, virtualQueueID uint32,
+	destinationMAC string,
+	flowLocation uint32,
 ) *RXQueueDevice {
+	location := flowLocation
 	return &RXQueueDevice{
-		PhysicalIfName:   d.PhysicalIfName,
-		HardwareAddress:  d.HardwareAddress,
-		MTU:              d.MTU,
-		TotalRXQueues:    d.TotalRXQueues,
-		ReservedQueueIDs: slices.Clone(d.ReservedQueueIDs),
-		Prepared:         true,
-		HostIfName:       hostIfName,
-		PeerIfName:       peerIfName,
-		PhysicalQueueID:  physicalQueueID,
-		VirtualQueueID:   virtualQueueID,
+		PhysicalIfName:       d.PhysicalIfName,
+		HardwareAddress:      d.HardwareAddress,
+		MTU:                  d.MTU,
+		TotalRXQueues:        d.TotalRXQueues,
+		ReservedQueueIDs:     slices.Clone(d.ReservedQueueIDs),
+		Prepared:             true,
+		HostIfName:           hostIfName,
+		PeerIfName:           peerIfName,
+		PhysicalQueueID:      physicalQueueID,
+		VirtualQueueID:       virtualQueueID,
+		RXFlowDestinationMAC: destinationMAC,
+		RXFlowLocation:       &location,
 	}
 }
 
@@ -800,8 +858,22 @@ func (d *RXQueueDevice) Free(allocation types.DeviceAllocation) error {
 		}
 		return fmt.Errorf("failed to find netkit host %s: %w", d.HostIfName, err)
 	}
-	if err := validateOwnedNetkit(host, ownershipAlias(d.HostIfName)); err != nil {
+	flowOwnership, err := ownedRXFlow(host, d.HostIfName)
+	if err != nil {
 		return err
+	}
+	if d.RXFlowLocation != nil {
+		if flowOwnership == nil ||
+			flowOwnership.location != *d.RXFlowLocation ||
+			(d.RXFlowDestinationMAC != "" && flowOwnership.destinationMAC != d.RXFlowDestinationMAC) {
+			return fmt.Errorf("%w: RX flow metadata on %s does not match stored device state",
+				errUnownedLink, d.HostIfName)
+		}
+	}
+	if flowOwnership != nil {
+		if err := deleteRXFlowIfExists(d.PhysicalIfName, flowOwnership.location); err != nil {
+			return err
+		}
 	}
 	if err := netlinkLinkDel(host); err != nil {
 		return fmt.Errorf("failed to delete netkit host %s: %w", d.HostIfName, err)
@@ -842,30 +914,34 @@ func (d *RXQueueDevice) KernelIfName() string {
 func (d *RXQueueDevice) Merge(_ types.Device) {}
 
 type deviceState struct {
-	PhysicalIfName   string   `json:"physicalIfName"`
-	HardwareAddress  string   `json:"hardwareAddress,omitempty"`
-	MTU              int      `json:"mtu,omitempty"`
-	TotalRXQueues    int      `json:"totalRXQueues"`
-	ReservedQueueIDs []uint32 `json:"reservedQueueIDs"`
-	Prepared         bool     `json:"prepared,omitempty"`
-	HostIfName       string   `json:"hostIfName,omitempty"`
-	PeerIfName       string   `json:"peerIfName,omitempty"`
-	PhysicalQueueID  uint32   `json:"physicalQueueID,omitempty"`
-	VirtualQueueID   uint32   `json:"virtualQueueID,omitempty"`
+	PhysicalIfName       string   `json:"physicalIfName"`
+	HardwareAddress      string   `json:"hardwareAddress,omitempty"`
+	MTU                  int      `json:"mtu,omitempty"`
+	TotalRXQueues        int      `json:"totalRXQueues"`
+	ReservedQueueIDs     []uint32 `json:"reservedQueueIDs"`
+	Prepared             bool     `json:"prepared,omitempty"`
+	HostIfName           string   `json:"hostIfName,omitempty"`
+	PeerIfName           string   `json:"peerIfName,omitempty"`
+	PhysicalQueueID      uint32   `json:"physicalQueueID,omitempty"`
+	VirtualQueueID       uint32   `json:"virtualQueueID,omitempty"`
+	RXFlowDestinationMAC string   `json:"rxFlowDestinationMAC,omitempty"`
+	RXFlowLocation       *uint32  `json:"rxFlowLocation,omitempty"`
 }
 
 func (d *RXQueueDevice) MarshalBinary() ([]byte, error) {
 	return json.Marshal(deviceState{
-		PhysicalIfName:   d.PhysicalIfName,
-		HardwareAddress:  d.HardwareAddress,
-		MTU:              d.MTU,
-		TotalRXQueues:    d.TotalRXQueues,
-		ReservedQueueIDs: d.ReservedQueueIDs,
-		Prepared:         d.Prepared,
-		HostIfName:       d.HostIfName,
-		PeerIfName:       d.PeerIfName,
-		PhysicalQueueID:  d.PhysicalQueueID,
-		VirtualQueueID:   d.VirtualQueueID,
+		PhysicalIfName:       d.PhysicalIfName,
+		HardwareAddress:      d.HardwareAddress,
+		MTU:                  d.MTU,
+		TotalRXQueues:        d.TotalRXQueues,
+		ReservedQueueIDs:     d.ReservedQueueIDs,
+		Prepared:             d.Prepared,
+		HostIfName:           d.HostIfName,
+		PeerIfName:           d.PeerIfName,
+		PhysicalQueueID:      d.PhysicalQueueID,
+		VirtualQueueID:       d.VirtualQueueID,
+		RXFlowDestinationMAC: d.RXFlowDestinationMAC,
+		RXFlowLocation:       d.RXFlowLocation,
 	})
 }
 
@@ -883,6 +959,21 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	if state.Prepared && (state.HostIfName == "" || state.PeerIfName == "") {
 		return errors.New("prepared RX queue device is missing its netkit interface names")
 	}
+	if (state.RXFlowLocation == nil) != (state.RXFlowDestinationMAC == "") {
+		return errors.New("RX queue device has incomplete RX flow state")
+	}
+	if state.RXFlowDestinationMAC != "" {
+		if !state.Prepared {
+			return errors.New("unprepared RX queue device has RX flow state")
+		}
+		mac, err := parseRXFlowDestinationMAC(state.RXFlowDestinationMAC)
+		if err != nil {
+			return fmt.Errorf("RX queue device has an invalid RX flow destination MAC: %w", err)
+		}
+		if mac.String() != state.RXFlowDestinationMAC {
+			return errors.New("RX queue device has a non-canonical RX flow destination MAC")
+		}
+	}
 
 	d.PhysicalIfName = state.PhysicalIfName
 	d.HardwareAddress = state.HardwareAddress
@@ -894,5 +985,11 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	d.PeerIfName = state.PeerIfName
 	d.PhysicalQueueID = state.PhysicalQueueID
 	d.VirtualQueueID = state.VirtualQueueID
+	d.RXFlowDestinationMAC = state.RXFlowDestinationMAC
+	d.RXFlowLocation = nil
+	if state.RXFlowLocation != nil {
+		location := *state.RXFlowLocation
+		d.RXFlowLocation = &location
+	}
 	return nil
 }

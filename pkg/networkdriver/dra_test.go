@@ -82,7 +82,10 @@ func TestSerializeDevice(t *testing.T) {
 		capacity := map[resourceapi.QualifiedName]apiresource.Quantity{
 			types.RXQueuesCapacity: apiresource.MustParse("1"),
 		}
-		a := allocation{Device: dev, Manager: types.DeviceManagerTypeRXQueue, ConsumedCapacity: capacity}
+		cfg := types.DeviceConfig{RXQueue: &types.RXQueueConfig{
+			DestinationMAC: "02:00:00:00:00:02",
+		}}
+		a := allocation{Device: dev, Config: cfg, Manager: types.DeviceManagerTypeRXQueue, ConsumedCapacity: capacity}
 
 		raw, err := serializeDevice(a)
 		require.NoError(t, err)
@@ -91,6 +94,7 @@ func TestSerializeDevice(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, types.DeviceManagerTypeRXQueue, serialized.Manager)
 		require.Equal(t, capacity, serialized.ConsumedCapacity)
+		require.Equal(t, cfg.RXQueue, serialized.Config.RXQueue)
 
 		mgr := &rxqueue.RXQueueManager{}
 		restored, err := mgr.RestoreDevice(serialized.Dev)
@@ -147,6 +151,32 @@ func TestDeviceClaimConfigs(t *testing.T) {
 		}
 		_, err := driver.deviceClaimConfigs(t.Context(), claim)
 		require.NoError(t, err)
+	})
+
+	t.Run("RX queue config", func(t *testing.T) {
+		claim := &resourceapi.ResourceClaim{
+			Status: resourceapi.ResourceClaimStatus{
+				Allocation: &resourceapi.AllocationResult{
+					Devices: resourceapi.DeviceAllocationResult{
+						Config: []resourceapi.DeviceAllocationConfiguration{
+							{
+								Requests: []string{"req"},
+								DeviceConfiguration: resourceapi.DeviceConfiguration{
+									Opaque: &resourceapi.OpaqueDeviceConfiguration{
+										Parameters: runtime.RawExtension{Raw: []byte(
+											`{"rxQueue":{"destinationMAC":"02:00:00:00:00:02"}}`,
+										)},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		configs, err := driver.deviceClaimConfigs(t.Context(), claim)
+		require.NoError(t, err)
+		require.Equal(t, &types.RXQueueConfig{DestinationMAC: "02:00:00:00:00:02"}, configs["req"].RXQueue)
 	})
 
 	t.Run("wrong reservedFor length", func(t *testing.T) {

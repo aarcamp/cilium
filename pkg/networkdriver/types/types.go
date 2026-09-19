@@ -213,12 +213,18 @@ type DeviceManager interface {
 }
 
 type DeviceConfig struct {
-	PodIfName string `json:"podIfName,omitempty"` // Custom interface name for the pod namespace
-	Vlan      int32  `json:"vlan,omitempty"`      // VLAN ID to assign to the device (0 = untagged / no change)
+	PodIfName string         `json:"podIfName,omitempty"` // Custom interface name for the pod namespace
+	Vlan      int32          `json:"vlan,omitempty"`      // VLAN ID to assign to the device (0 = untagged / no change)
+	RXQueue   *RXQueueConfig `json:"rxQueue,omitempty"`
 }
 
 func (d *DeviceConfig) Empty() bool {
 	return d == nil || *d == DeviceConfig{}
+}
+
+// RXQueueConfig selects traffic for an allocated RX queue.
+type RXQueueConfig struct {
+	DestinationMAC string `json:"destinationMAC,omitempty"`
 }
 
 // DeviceAllocation contains scheduler and driver parameters for one allocation.

@@ -62,6 +62,9 @@ var (
 	netlinkNetDevRxFlowInsert = netlink.NetDevRxFlowInsert
 	netlinkNetDevRxFlowDelete = netlink.NetDevRxFlowDelete
 	netlinkNetDevRxFlowList   = netlink.NetDevRxFlowList
+	zcrxRedirectProgramEnsure = ensureZCRXRedirectProgram
+	zcrxRedirectEnsure        = ensureZCRXRedirect
+	zcrxRedirectDelete        = deleteZCRXRedirect
 )
 
 type RXQueueManager struct {
@@ -71,6 +74,13 @@ type RXQueueManager struct {
 func NewManager(logger *slog.Logger, cfg *v2alpha1.RXQueueDeviceManagerConfig) (*RXQueueManager, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
+	}
+	ifNames := make([]string, 0, len(cfg.Ifaces))
+	for _, iface := range cfg.Ifaces {
+		ifNames = append(ifNames, iface.IfName)
+	}
+	if err := zcrxRedirectProgramEnsure(ifNames); err != nil {
+		return nil, fmt.Errorf("failed to initialize ZCRX ingress redirects: %w", err)
 	}
 
 	mgr := &RXQueueManager{}
@@ -566,18 +576,18 @@ func (d *RXQueueDevice) Setup(allocation types.DeviceAllocation) (types.Device, 
 		return nil, fmt.Errorf("%w: stored RX flow destination MAC does not match allocation", errInvalidAllocation)
 	}
 
-	if prepared, exists, err := d.adoptExisting(hostIfName, peerIfName, flow, destinationMAC); err != nil {
-		return nil, err
-	} else if exists {
-		return prepared, nil
-	}
-
 	physical, err := netlinkLinkByName(d.PhysicalIfName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find physical interface %s: %w", d.PhysicalIfName, err)
 	}
 	if physical.Attrs().Flags&net.FlagUp == 0 {
 		return nil, fmt.Errorf("physical interface %s is down", d.PhysicalIfName)
+	}
+
+	if prepared, exists, err := d.adoptExisting(physical, hostIfName, peerIfName, flow, destinationMAC); err != nil {
+		return nil, err
+	} else if exists {
+		return prepared, nil
 	}
 
 	return d.createLease(physical, hostIfName, peerIfName, flow, destinationMAC)
@@ -613,6 +623,7 @@ func ownershipAlias(ifName string) string {
 }
 
 func (d *RXQueueDevice) adoptExisting(
+	physical netlink.Link,
 	hostIfName, peerIfName string,
 	flow netlink.EtherFlow,
 	destinationMAC string,
@@ -655,10 +666,22 @@ func (d *RXQueueDevice) adoptExisting(
 			return nil, true, err
 		}
 		if leaseMatches(queue.Lease, peer.Attrs().Index) {
+			redirectCreated, err := zcrxRedirectEnsure(
+				physical.Attrs().Index, host.Attrs().Index, flow.DstMAC,
+			)
+			if err != nil {
+				return nil, true, fmt.Errorf("failed to redirect destination MAC %s from %s to netkit host %s: %w",
+					destinationMAC, d.PhysicalIfName, hostIfName, err)
+			}
 			location, err := ensureRXFlow(
 				d.PhysicalIfName, physicalQueueID, flow, destinationMAC, host, flowOwnership,
 			)
 			if err != nil {
+				if redirectCreated {
+					err = errors.Join(err, zcrxRedirectDelete(
+						physical.Attrs().Index, host.Attrs().Index, flow.DstMAC,
+					))
+				}
 				return nil, true, err
 			}
 			return d.prepared(
@@ -667,12 +690,20 @@ func (d *RXQueueDevice) adoptExisting(
 		}
 	}
 
-	// A prior setup stopped after creating the pair but before creating its
-	// lease. Remove the manager-owned partial state and let setup start again.
+	// Remove manager-owned partial state and let setup start again.
+	redirectMAC := flow.DstMAC
 	if flowOwnership != nil {
 		if err := deleteRXFlowIfExists(d.PhysicalIfName, flowOwnership.location); err != nil {
 			return nil, true, err
 		}
+		mac, err := parseRXFlowDestinationMAC(flowOwnership.destinationMAC)
+		if err != nil {
+			return nil, true, fmt.Errorf("failed to parse owned RX flow destination MAC: %w", err)
+		}
+		redirectMAC = mac
+	}
+	if err := zcrxRedirectDelete(physical.Attrs().Index, host.Attrs().Index, redirectMAC); err != nil {
+		return nil, true, fmt.Errorf("failed to delete incomplete ZCRX redirect: %w", err)
 	}
 	if err := netlinkLinkDel(host); err != nil {
 		return nil, true, fmt.Errorf("failed to clean up incomplete netkit host %s: %w", hostIfName, err)
@@ -714,9 +745,15 @@ func (d *RXQueueDevice) createLease(
 	}
 
 	cleanup := true
+	redirectReady := false
 	defer func() {
 		if !cleanup {
 			return
+		}
+		if redirectReady {
+			if cleanupErr := zcrxRedirectDelete(physical.Attrs().Index, host.Attrs().Index, flow.DstMAC); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("failed to clean up ZCRX redirect: %w", cleanupErr))
+			}
 		}
 		if cleanupErr := netlinkLinkDel(host); cleanupErr != nil {
 			err = errors.Join(err, fmt.Errorf("failed to clean up netkit host %s: %w", hostIfName, cleanupErr))
@@ -775,6 +812,15 @@ func (d *RXQueueDevice) createLease(
 			return nil, fmt.Errorf("kernel returned an unexpected lease for RX queue %s/%d",
 				d.PhysicalIfName, physicalQueueID)
 		}
+
+		_, err = zcrxRedirectEnsure(
+			physical.Attrs().Index, host.Attrs().Index, flow.DstMAC,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to redirect destination MAC %s from %s to netkit host %s: %w",
+				destinationMAC, d.PhysicalIfName, hostIfName, err)
+		}
+		redirectReady = true
 
 		location, err := ensureRXFlow(
 			d.PhysicalIfName, physicalQueueID, flow, destinationMAC, host, nil,
@@ -868,6 +914,17 @@ func (d *RXQueueDevice) Free(allocation types.DeviceAllocation) error {
 	if flowOwnership != nil {
 		if err := deleteRXFlowIfExists(d.PhysicalIfName, flowOwnership.location); err != nil {
 			return err
+		}
+		physical, err := netlinkLinkByName(d.PhysicalIfName)
+		if err != nil {
+			return fmt.Errorf("failed to find physical interface %s: %w", d.PhysicalIfName, err)
+		}
+		mac, err := parseRXFlowDestinationMAC(flowOwnership.destinationMAC)
+		if err != nil {
+			return fmt.Errorf("failed to parse owned RX flow destination MAC: %w", err)
+		}
+		if err := zcrxRedirectDelete(physical.Attrs().Index, host.Attrs().Index, mac); err != nil {
+			return fmt.Errorf("failed to delete ZCRX redirect for %s: %w", flowOwnership.destinationMAC, err)
 		}
 	}
 	if err := netlinkLinkDel(host); err != nil {

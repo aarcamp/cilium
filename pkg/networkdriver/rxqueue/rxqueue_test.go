@@ -79,6 +79,29 @@ type fakeNetlink struct {
 	peerIfName           string
 	addCalls             int
 	deleteCalls          int
+	redirectProgramCalls [][]string
+	redirects            map[zcrxRedirectMapKey]int
+	redirectEnsureCalls  []zcrxRedirectRequest
+	redirectDeleteCalls  []zcrxRedirectRequest
+	redirectProgramError error
+	redirectEnsureError  error
+	redirectDeleteError  error
+	operations           []string
+}
+
+type zcrxRedirectRequest struct {
+	physicalIfIndex int
+	netkitIfIndex   int
+	destinationMAC  string
+}
+
+type zcrxRedirectMapKey struct {
+	physicalIfIndex int
+	destinationMAC  string
+}
+
+func fakeZCRXRedirectKey(physicalIfIndex int, destinationMAC string) zcrxRedirectMapKey {
+	return zcrxRedirectMapKey{physicalIfIndex, destinationMAC}
 }
 
 func newFakeNetlink(maxRXQueues, realRXQueues int, shareID kube_types.UID) *fakeNetlink {
@@ -119,6 +142,7 @@ func newFakeNetlink(maxRXQueues, realRXQueues int, shareID kube_types.UID) *fake
 		},
 		features:         make(map[string]netlink.NetDevFeature),
 		flows:            make(map[uint32]netlink.NetDevRxFlow),
+		redirects:        make(map[zcrxRedirectMapKey]int),
 		nextFlowLocation: 100,
 		hostIfName:       hostIfName,
 		peerIfName:       peerIfName,
@@ -144,6 +168,9 @@ func (f *fakeNetlink) install(t *testing.T) {
 	originalFlowInsert := netlinkNetDevRxFlowInsert
 	originalFlowDelete := netlinkNetDevRxFlowDelete
 	originalFlowList := netlinkNetDevRxFlowList
+	originalRedirectProgramEnsure := zcrxRedirectProgramEnsure
+	originalRedirectEnsure := zcrxRedirectEnsure
+	originalRedirectDelete := zcrxRedirectDelete
 	t.Cleanup(func() {
 		netlinkLinkByName = originalLinkByName
 		netlinkLinkAdd = originalLinkAdd
@@ -161,7 +188,56 @@ func (f *fakeNetlink) install(t *testing.T) {
 		netlinkNetDevRxFlowInsert = originalFlowInsert
 		netlinkNetDevRxFlowDelete = originalFlowDelete
 		netlinkNetDevRxFlowList = originalFlowList
+		zcrxRedirectProgramEnsure = originalRedirectProgramEnsure
+		zcrxRedirectEnsure = originalRedirectEnsure
+		zcrxRedirectDelete = originalRedirectDelete
 	})
+
+	zcrxRedirectProgramEnsure = func(ifNames []string) error {
+		f.redirectProgramCalls = append(f.redirectProgramCalls, slices.Clone(ifNames))
+		return f.redirectProgramError
+	}
+	zcrxRedirectEnsure = func(physicalIfIndex, netkitIfIndex int, destinationMAC net.HardwareAddr) (bool, error) {
+		request := zcrxRedirectRequest{
+			physicalIfIndex: physicalIfIndex,
+			netkitIfIndex:   netkitIfIndex,
+			destinationMAC:  destinationMAC.String(),
+		}
+		f.redirectEnsureCalls = append(f.redirectEnsureCalls, request)
+		if f.redirectEnsureError != nil {
+			return false, f.redirectEnsureError
+		}
+		key := fakeZCRXRedirectKey(physicalIfIndex, request.destinationMAC)
+		if existing, ok := f.redirects[key]; ok {
+			if existing != netkitIfIndex {
+				return false, errors.New("destination MAC already has a different redirect")
+			}
+			return false, nil
+		}
+		f.redirects[key] = netkitIfIndex
+		f.operations = append(f.operations, "redirect-add")
+		return true, nil
+	}
+	zcrxRedirectDelete = func(physicalIfIndex, netkitIfIndex int, destinationMAC net.HardwareAddr) error {
+		request := zcrxRedirectRequest{
+			physicalIfIndex: physicalIfIndex,
+			netkitIfIndex:   netkitIfIndex,
+			destinationMAC:  destinationMAC.String(),
+		}
+		f.redirectDeleteCalls = append(f.redirectDeleteCalls, request)
+		if f.redirectDeleteError != nil {
+			return f.redirectDeleteError
+		}
+		key := fakeZCRXRedirectKey(physicalIfIndex, request.destinationMAC)
+		if existing, ok := f.redirects[key]; ok {
+			if existing != netkitIfIndex {
+				return errors.New("destination MAC redirect has a different target")
+			}
+			delete(f.redirects, key)
+			f.operations = append(f.operations, "redirect-delete")
+		}
+		return nil
+	}
 
 	netlinkLinkByName = func(name string) (netlink.Link, error) {
 		link, exists := f.links[name]
@@ -194,6 +270,7 @@ func (f *fakeNetlink) install(t *testing.T) {
 	}
 	netlinkLinkDel = func(link netlink.Link) error {
 		f.deleteCalls++
+		f.operations = append(f.operations, "link-delete")
 		delete(f.links, f.hostIfName)
 		delete(f.links, f.peerIfName)
 		for queueID, lease := range f.leases {
@@ -351,6 +428,14 @@ func (f *fakeNetlink) install(t *testing.T) {
 		if f.leases[flow.Queue] == nil {
 			return 0, errors.New("RX flow inserted before queue lease")
 		}
+		etherFlow, ok := flow.Match.(netlink.EtherFlow)
+		if !ok {
+			return 0, errors.New("expected Ethernet RX flow")
+		}
+		if _, ok := f.redirects[fakeZCRXRedirectKey(testPhysicalIndex, etherFlow.DstMAC.String())]; !ok {
+			return 0, errors.New("RX flow inserted before ZCRX redirect")
+		}
+		f.operations = append(f.operations, "flow-insert")
 
 		location := flow.Location
 		if location == netlink.RX_CLS_LOC_ANY {
@@ -374,6 +459,7 @@ func (f *fakeNetlink) install(t *testing.T) {
 			return unix.ENODEV
 		}
 		f.flowDeleteRequests = append(f.flowDeleteRequests, location)
+		f.operations = append(f.operations, "flow-delete")
 		if f.flowDeleteError != nil {
 			return f.flowDeleteError
 		}
@@ -572,6 +658,20 @@ func TestRSSTableWithoutReservedQueues(t *testing.T) {
 }
 
 func TestNewManager(t *testing.T) {
+	t.Run("requires the ingress redirect program", func(t *testing.T) {
+		fake := newFakeNetlink(8, 4, testShareID)
+		fake.redirectProgramError = unix.EOPNOTSUPP
+		fake.install(t)
+
+		_, err := NewManager(hivetest.Logger(t), &v2alpha1.RXQueueDeviceManagerConfig{
+			Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: testPhysicalIfName}},
+		})
+		require.ErrorIs(t, err, unix.EOPNOTSUPP)
+		require.Equal(t, [][]string{{testPhysicalIfName}}, fake.redirectProgramCalls)
+		require.Empty(t, fake.rssSetCalls)
+		require.Empty(t, fake.ringsSetCalls)
+	})
+
 	t.Run("leaves one queue for normal receive processing", func(t *testing.T) {
 		fake := newFakeNetlink(8, 1, testShareID)
 		fake.install(t)
@@ -599,6 +699,7 @@ func TestNewManager(t *testing.T) {
 		require.Equal(t, []uint32{1}, dev.ReservedQueueIDs)
 		require.Equal(t, testPhysicalIfName, dev.IfName())
 		require.True(t, dev.AllowMultipleAllocations())
+		require.Equal(t, [][]string{{testPhysicalIfName}}, fake.redirectProgramCalls)
 
 		capacity := dev.GetCapacity()[types.RXQueuesCapacity]
 		require.Zero(t, capacity.Value.Cmp(apiresource.MustParse("1")))
@@ -955,6 +1056,20 @@ func TestAllocationIfNames(t *testing.T) {
 	require.NotEqual(t, peer0, peer1)
 }
 
+func TestZCRXRedirectKeyFor(t *testing.T) {
+	mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}
+	key, err := zcrxRedirectKeyFor(testPhysicalIndex, mac)
+	require.NoError(t, err)
+	require.Equal(t, uint32(testPhysicalIndex), key.IngressIfindex)
+	require.Equal(t, [6]uint8(mac), key.DestinationMac)
+	require.Zero(t, key.Pad)
+
+	_, err = zcrxRedirectKeyFor(0, mac)
+	require.Error(t, err)
+	_, err = zcrxRedirectKeyFor(testPhysicalIndex, net.HardwareAddr{0x02})
+	require.Error(t, err)
+}
+
 func TestRXFlowForAllocation(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1067,13 +1182,23 @@ func TestSetupAndFree(t *testing.T) {
 		require.Equal(t, 9000, fake.addedNetkit.Attrs().MTU)
 		require.Equal(t, netkitTxQLen, fake.addedNetkit.Attrs().TxQLen)
 		require.NotZero(t, fake.links[fake.hostIfName].Attrs().Flags&net.FlagUp)
+		require.Equal(t, testHostIndex, fake.redirects[fakeZCRXRedirectKey(testPhysicalIndex, testDestinationMAC)])
+		require.Equal(t, []zcrxRedirectRequest{{
+			physicalIfIndex: testPhysicalIndex,
+			netkitIfIndex:   testHostIndex,
+			destinationMAC:  testDestinationMAC,
+		}}, fake.redirectEnsureCalls)
 
 		require.NoError(t, prepared.Free(allocation))
 		require.Equal(t, 1, fake.deleteCalls)
 		require.NotContains(t, fake.links, fake.hostIfName)
 		require.NotContains(t, fake.leases, uint32(6))
 		require.Empty(t, fake.flows)
+		require.Empty(t, fake.redirects)
 		require.Equal(t, []uint32{100}, fake.flowDeleteRequests)
+		require.Equal(t, []string{
+			"redirect-add", "flow-insert", "flow-delete", "redirect-delete", "link-delete",
+		}, fake.operations)
 	})
 
 	t.Run("uses an explicit free rule location when the driver rejects automatic allocation", func(t *testing.T) {
@@ -1162,6 +1287,21 @@ func TestSetupAndFree(t *testing.T) {
 		require.Equal(t, 1, fake.deleteCalls)
 	})
 
+	t.Run("redirect failure rolls back lease and netkit pair", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.redirectEnsureError = unix.EIO
+		fake.install(t)
+
+		_, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.ErrorIs(t, err, unix.EIO)
+		require.Equal(t, 1, fake.deleteCalls)
+		require.NotContains(t, fake.links, fake.hostIfName)
+		require.Empty(t, fake.leases)
+		require.Empty(t, fake.flows)
+		require.Empty(t, fake.redirects)
+		require.Empty(t, fake.flowInsertRequests)
+	})
+
 	t.Run("flow insertion failure rolls back lease and netkit pair", func(t *testing.T) {
 		fake := newFakeNetlink(8, 8, testShareID)
 		fake.flowInsertError = unix.EOPNOTSUPP
@@ -1173,7 +1313,23 @@ func TestSetupAndFree(t *testing.T) {
 		require.NotContains(t, fake.links, fake.hostIfName)
 		require.Empty(t, fake.leases)
 		require.Empty(t, fake.flows)
+		require.Empty(t, fake.redirects)
 		require.Empty(t, fake.flowDeleteRequests)
+		require.Equal(t, []string{"redirect-add", "redirect-delete", "link-delete"}, fake.operations)
+	})
+
+	t.Run("flow insertion failure removes an adopted redirect for a new pair", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.redirects[fakeZCRXRedirectKey(testPhysicalIndex, testDestinationMAC)] = testHostIndex
+		fake.flowInsertError = unix.EOPNOTSUPP
+		fake.install(t)
+
+		_, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.ErrorIs(t, err, unix.EOPNOTSUPP)
+		require.Empty(t, fake.redirects)
+		require.NotContains(t, fake.links, fake.hostIfName)
+		require.Empty(t, fake.leases)
+		require.Equal(t, []string{"redirect-delete", "link-delete"}, fake.operations)
 	})
 
 	t.Run("flow ownership failure rolls back rule lease and netkit pair", func(t *testing.T) {
@@ -1245,6 +1401,7 @@ func TestSetupAndFree(t *testing.T) {
 		require.Equal(t, uint32(100), *prepared.RXFlowLocation)
 		require.Contains(t, fake.flows, uint32(100))
 		require.Equal(t, rxFlowOwnershipAlias(fake.hostIfName, rxFlowOwnership{100, testDestinationMAC}), fake.links[fake.hostIfName].Attrs().Alias)
+		require.Equal(t, testHostIndex, fake.redirects[fakeZCRXRedirectKey(testPhysicalIndex, testDestinationMAC)])
 	})
 
 	t.Run("completes ownership of an existing lease on retry", func(t *testing.T) {
@@ -1297,6 +1454,7 @@ func TestSetupAndFree(t *testing.T) {
 		require.Empty(t, fake.flowInsertRequests)
 		require.Empty(t, fake.flowDeleteRequests)
 		require.Zero(t, fake.addCalls)
+		require.Equal(t, testHostIndex, fake.redirects[fakeZCRXRedirectKey(testPhysicalIndex, testDestinationMAC)])
 	})
 
 	t.Run("recreates a missing owned flow", func(t *testing.T) {
@@ -1348,6 +1506,31 @@ func TestSetupAndFree(t *testing.T) {
 		require.Zero(t, fake.deleteCalls)
 	})
 
+	t.Run("redirect cleanup failure keeps the owned netkit for retry", func(t *testing.T) {
+		fake := newFakeNetlink(8, 8, testShareID)
+		fake.install(t)
+
+		device, err := testDevice(8).Setup(testAllocation(testShareID))
+		require.NoError(t, err)
+		prepared := device.(*RXQueueDevice)
+
+		fake.redirectDeleteError = unix.EIO
+		err = prepared.Free(testAllocation(testShareID))
+		require.ErrorIs(t, err, unix.EIO)
+		require.Empty(t, fake.flows)
+		require.Equal(t, testHostIndex, fake.redirects[fakeZCRXRedirectKey(testPhysicalIndex, testDestinationMAC)])
+		require.Contains(t, fake.links, fake.hostIfName)
+		require.Contains(t, fake.leases, prepared.PhysicalQueueID)
+		require.Zero(t, fake.deleteCalls)
+
+		fake.redirectDeleteError = nil
+		require.NoError(t, prepared.Free(testAllocation(testShareID)))
+		require.Empty(t, fake.redirects)
+		require.NotContains(t, fake.links, fake.hostIfName)
+		require.NotContains(t, fake.leases, prepared.PhysicalQueueID)
+		require.Equal(t, 1, fake.deleteCalls)
+	})
+
 	t.Run("replaces an incomplete owned pair on retry", func(t *testing.T) {
 		fake := newFakeNetlink(8, 8, testShareID)
 		fake.links[fake.hostIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
@@ -1356,6 +1539,7 @@ func TestSetupAndFree(t *testing.T) {
 		fake.links[fake.peerIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
 			Name: fake.peerIfName, Index: testPeerIndex,
 		}}
+		fake.redirects[fakeZCRXRedirectKey(testPhysicalIndex, testDestinationMAC)] = testHostIndex
 		fake.install(t)
 
 		device, err := testDevice(8).Setup(testAllocation(testShareID))
@@ -1363,6 +1547,8 @@ func TestSetupAndFree(t *testing.T) {
 		require.Equal(t, uint32(7), device.(*RXQueueDevice).PhysicalQueueID)
 		require.Equal(t, 1, fake.deleteCalls)
 		require.Equal(t, 1, fake.addCalls)
+		require.Len(t, fake.redirectDeleteCalls, 1)
+		require.Equal(t, testHostIndex, fake.redirects[fakeZCRXRedirectKey(testPhysicalIndex, testDestinationMAC)])
 	})
 
 	t.Run("deletes an owned flow before replacing an incomplete pair", func(t *testing.T) {

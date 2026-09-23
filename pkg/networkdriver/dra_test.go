@@ -104,6 +104,25 @@ func TestDeviceClaimConfigs(t *testing.T) {
 	driver := &Driver{
 		logger: tlog,
 	}
+	claimWithConfig := func(raw string) *resourceapi.ResourceClaim {
+		return &resourceapi.ResourceClaim{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "claim"},
+			Status: resourceapi.ResourceClaimStatus{
+				Allocation: &resourceapi.AllocationResult{
+					Devices: resourceapi.DeviceAllocationResult{
+						Config: []resourceapi.DeviceAllocationConfiguration{{
+							Requests: []string{"req"},
+							DeviceConfiguration: resourceapi.DeviceConfiguration{
+								Opaque: &resourceapi.OpaqueDeviceConfiguration{
+									Parameters: runtime.RawExtension{Raw: []byte(raw)},
+								},
+							},
+						}},
+					},
+				},
+			},
+		}
+	}
 
 	t.Run("invalid JSON", func(t *testing.T) {
 		claim := &resourceapi.ResourceClaim{
@@ -126,6 +145,22 @@ func TestDeviceClaimConfigs(t *testing.T) {
 		}
 		_, err := driver.deviceClaimConfigs(t.Context(), claim)
 		require.Error(t, err)
+	})
+
+	t.Run("valid RX queue endpoint", func(t *testing.T) {
+		claim := claimWithConfig(`{"rxQueue":{"podEndpoint":{"port":"9000","protocol":"TCP"}}}`)
+
+		configs, err := driver.deviceClaimConfigs(t.Context(), claim)
+		require.NoError(t, err)
+		require.Equal(t, "9000", configs["req"].RXQueue.PodEndpoint.Port)
+	})
+
+	t.Run("invalid RX queue endpoint", func(t *testing.T) {
+		claim := claimWithConfig(`{"rxQueue":{"podEndpoint":{"port":"9000","protocol":"TCP"},"serviceEndpoint":{"serviceName":"storage","port":"rpc"}}}`)
+
+		_, err := driver.deviceClaimConfigs(t.Context(), claim)
+		require.ErrorIs(t, err, errUnexpectedInput)
+		require.ErrorContains(t, err, "podEndpoint and serviceEndpoint are mutually exclusive")
 	})
 
 	t.Run("empty config", func(t *testing.T) {

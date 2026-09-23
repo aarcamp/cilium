@@ -338,6 +338,11 @@ func (driver *Driver) deviceClaimConfigs(ctx context.Context, claim *resourceapi
 				)
 				return nil, fmt.Errorf("failed to unmarshal config for %s: %w", path.Join(claim.Namespace, claim.Name), err)
 			}
+			if c.RXQueue != nil {
+				if err := validateRXQueueConfig(c.RXQueue); err != nil {
+					return nil, fmt.Errorf("invalid RX queue config for %s: %w", path.Join(claim.Namespace, claim.Name), err)
+				}
+			}
 			for _, request := range cfg.Requests {
 				devicesCfg[request] = c
 			}

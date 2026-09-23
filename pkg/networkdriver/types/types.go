@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	kube_types "k8s.io/apimachinery/pkg/types"
@@ -217,12 +218,34 @@ type DeviceManager interface {
 }
 
 type DeviceConfig struct {
-	PodIfName string `json:"podIfName,omitempty"` // Custom interface name for the pod namespace
-	Vlan      int32  `json:"vlan,omitempty"`      // VLAN ID to assign to the device (0 = untagged / no change)
+	PodIfName string         `json:"podIfName,omitempty"` // Custom interface name for the pod namespace
+	Vlan      int32          `json:"vlan,omitempty"`      // VLAN ID to assign to the device (0 = untagged / no change)
+	RXQueue   *RXQueueConfig `json:"rxQueue,omitempty"`
 }
 
 func (d *DeviceConfig) Empty() bool {
 	return d == nil || *d == DeviceConfig{}
+}
+
+// RXQueueConfig selects traffic for an allocated RX queue. Exactly one endpoint
+// must be specified.
+type RXQueueConfig struct {
+	PodEndpoint     *RXQueuePodEndpoint     `json:"podEndpoint,omitempty"`
+	ServiceEndpoint *RXQueueServiceEndpoint `json:"serviceEndpoint,omitempty"`
+}
+
+// RXQueuePodEndpoint selects a port on the pod consuming the ResourceClaim.
+// Port may be a decimal port number or a named container port.
+type RXQueuePodEndpoint struct {
+	Port     string          `json:"port"`
+	Protocol corev1.Protocol `json:"protocol"`
+}
+
+// RXQueueServiceEndpoint selects a port on a Service in the ResourceClaim's
+// namespace. Port may be the Service port's name or decimal port number.
+type RXQueueServiceEndpoint struct {
+	ServiceName string `json:"serviceName"`
+	Port        string `json:"port"`
 }
 
 // DeviceAllocation contains scheduler and driver parameters for one allocation.

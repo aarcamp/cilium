@@ -524,6 +524,24 @@ func (d *RXQueueDevice) Recover(allocation types.DeviceAllocation) (types.Device
 		return nil, recoveryErr
 	}
 
+	recovered.rxFlows = slices.Clone(d.rxFlows)
+	if len(d.rxFlows) != 0 {
+		flows := make([]types.RXQueueFlow, 0, len(d.rxFlows))
+		for _, flow := range d.rxFlows {
+			flows = append(flows, flow.Flow)
+		}
+		device, err := recovered.SetRXQueueFlows(flows)
+		if err != nil {
+			recoveryErr := fmt.Errorf("failed to recover RX flow rules: %w", err)
+			if cleanupErr := recovered.Free(allocation); cleanupErr != nil {
+				recoveryErr = errors.Join(recoveryErr,
+					fmt.Errorf("failed to clean up recovered RX queue device: %w", cleanupErr))
+			}
+			return nil, recoveryErr
+		}
+		return device, nil
+	}
+
 	return recovered, nil
 }
 
@@ -856,16 +874,17 @@ func (d *RXQueueDevice) KernelIfName() string {
 func (d *RXQueueDevice) Merge(_ types.Device) {}
 
 type deviceState struct {
-	PhysicalIfName   string   `json:"physicalIfName"`
-	HardwareAddress  string   `json:"hardwareAddress,omitempty"`
-	MTU              int      `json:"mtu,omitempty"`
-	TotalRXQueues    int      `json:"totalRXQueues"`
-	ReservedQueueIDs []uint32 `json:"reservedQueueIDs"`
-	Prepared         bool     `json:"prepared,omitempty"`
-	HostIfName       string   `json:"hostIfName,omitempty"`
-	PeerIfName       string   `json:"peerIfName,omitempty"`
-	PhysicalQueueID  uint32   `json:"physicalQueueID,omitempty"`
-	VirtualQueueID   uint32   `json:"virtualQueueID,omitempty"`
+	PhysicalIfName   string        `json:"physicalIfName"`
+	HardwareAddress  string        `json:"hardwareAddress,omitempty"`
+	MTU              int           `json:"mtu,omitempty"`
+	TotalRXQueues    int           `json:"totalRXQueues"`
+	ReservedQueueIDs []uint32      `json:"reservedQueueIDs"`
+	Prepared         bool          `json:"prepared,omitempty"`
+	HostIfName       string        `json:"hostIfName,omitempty"`
+	PeerIfName       string        `json:"peerIfName,omitempty"`
+	PhysicalQueueID  uint32        `json:"physicalQueueID,omitempty"`
+	VirtualQueueID   uint32        `json:"virtualQueueID,omitempty"`
+	RXFlows          []rxFlowState `json:"rxFlows,omitempty"`
 }
 
 func (d *RXQueueDevice) MarshalBinary() ([]byte, error) {
@@ -880,6 +899,7 @@ func (d *RXQueueDevice) MarshalBinary() ([]byte, error) {
 		PeerIfName:       d.PeerIfName,
 		PhysicalQueueID:  d.PhysicalQueueID,
 		VirtualQueueID:   d.VirtualQueueID,
+		RXFlows:          slices.Clone(d.rxFlows),
 	})
 }
 
@@ -897,6 +917,30 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	if state.Prepared && (state.HostIfName == "" || state.PeerIfName == "") {
 		return errors.New("prepared RX queue device is missing its netkit interface names")
 	}
+	if !state.Prepared && len(state.RXFlows) != 0 {
+		return errors.New("unprepared RX queue device contains RX flow rules")
+	}
+	if len(state.RXFlows) != 0 {
+		flows := make([]types.RXQueueFlow, 0, len(state.RXFlows))
+		locations := make(map[uint32]struct{}, len(state.RXFlows))
+		for _, flow := range state.RXFlows {
+			if flow.Location >= netlink.RX_CLS_LOC_LAST {
+				return fmt.Errorf("RX flow location %d is invalid", flow.Location)
+			}
+			if _, exists := locations[flow.Location]; exists {
+				return fmt.Errorf("RX flow location %d is duplicated", flow.Location)
+			}
+			locations[flow.Location] = struct{}{}
+			flows = append(flows, flow.Flow)
+		}
+		normalized, err := normalizeRXFlows(flows)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(normalized, flows) {
+			return errors.New("RX flow rules are not in canonical order")
+		}
+	}
 
 	d.PhysicalIfName = state.PhysicalIfName
 	d.HardwareAddress = state.HardwareAddress
@@ -908,5 +952,6 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	d.PeerIfName = state.PeerIfName
 	d.PhysicalQueueID = state.PhysicalQueueID
 	d.VirtualQueueID = state.VirtualQueueID
+	d.rxFlows = slices.Clone(state.RXFlows)
 	return nil
 }

@@ -76,6 +76,11 @@ func TestSetRXQueueFlows(t *testing.T) {
 		flows[1],
 		flows[0],
 	}), ownership.digest)
+	data, err := programmed.MarshalBinary()
+	require.NoError(t, err)
+	restoredDevice, err := (&RXQueueManager{}).RestoreDevice(data)
+	require.NoError(t, err)
+	require.Equal(t, programmed.rxFlows, restoredDevice.(*RXQueueDevice).rxFlows)
 
 	_, err = programmed.SetRXQueueFlows([]types.RXQueueFlow{flows[0], flows[1]})
 	require.NoError(t, err)
@@ -107,4 +112,35 @@ func TestSetRXQueueFlowsRollsBack(t *testing.T) {
 	require.Empty(t, fake.flows)
 	require.Equal(t, []uint32{100}, fake.flowDeleteCalls)
 	require.Equal(t, ownershipAlias(fake.hostIfName), fake.links[fake.hostIfName].Attrs().Alias)
+}
+
+func TestRecoverRXQueueFlows(t *testing.T) {
+	fake := newFakeNetlink(8, 8, testShareID)
+	fake.install(t)
+	prepared := prepareTestRXQueue(t, fake)
+	flows := testRXFlows()[:1]
+
+	device, err := prepared.SetRXQueueFlows(flows)
+	require.NoError(t, err)
+	data, err := device.MarshalBinary()
+	require.NoError(t, err)
+	restoredDevice, err := (&RXQueueManager{}).RestoreDevice(data)
+	require.NoError(t, err)
+
+	delete(fake.links, fake.hostIfName)
+	delete(fake.links, fake.peerIfName)
+	clear(fake.leases)
+	clear(fake.flows)
+
+	recoveredDevice, err := restoredDevice.Recover(testAllocation(testShareID))
+	require.NoError(t, err)
+	recovered := recoveredDevice.(*RXQueueDevice)
+	require.Equal(t, flows[0], recovered.rxFlows[0].Flow)
+	require.Equal(t, uint32(101), recovered.rxFlows[0].Location)
+	require.Contains(t, fake.flows, uint32(101))
+	require.Equal(t, uint32(7), fake.flows[101].Queue)
+
+	require.NoError(t, recovered.Free(testAllocation(testShareID)))
+	require.Empty(t, fake.flows)
+	require.NotContains(t, fake.links, fake.hostIfName)
 }

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/vishvananda/netlink"
@@ -29,6 +30,8 @@ const (
 	defaultReservedRXQueues = 1
 	mainRSSContext          = 0
 	firstLeasedRXQueueID    = 1
+
+	ownershipPrefix = "cilium-zcrx:"
 )
 
 var (
@@ -37,14 +40,19 @@ var (
 	errInsufficientRXQueues = errors.New("insufficient RX queues")
 	errNoAvailableRXQueue   = errors.New("no reserved RX queue is available")
 	errInvalidAllocation    = errors.New("invalid RX queue allocation")
+	errUnownedLink          = errors.New("refusing to use link not owned by the RX queue manager")
 	errActiveLease          = errors.New("RX queue lease is still active")
 
-	netlinkLinkByName     = safenetlink.LinkByName
-	netlinkNetDevQueueGet = netlink.NetDevQueueGet
-	netlinkNetDevRSSGet   = netlink.NetDevRSSGet
-	netlinkNetDevRSSSet   = netlink.NetDevRSSSet
-	netlinkNetDevRingsGet = netlink.NetDevRingsGet
-	netlinkNetDevRingsSet = netlink.NetDevRingsSet
+	netlinkLinkByName         = safenetlink.LinkByName
+	netlinkNetDevQueueGet     = netlink.NetDevQueueGet
+	netlinkNetDevRSSGet       = netlink.NetDevRSSGet
+	netlinkNetDevRSSSet       = netlink.NetDevRSSSet
+	netlinkNetDevRingsGet     = netlink.NetDevRingsGet
+	netlinkNetDevRingsSet     = netlink.NetDevRingsSet
+	netlinkLinkSetAlias       = netlink.LinkSetAlias
+	netlinkNetDevRxFlowInsert = netlink.NetDevRxFlowInsert
+	netlinkNetDevRxFlowDelete = netlink.NetDevRxFlowDelete
+	netlinkNetDevRxFlowList   = netlink.NetDevRxFlowList
 )
 
 type RXQueueManager struct {
@@ -445,6 +453,7 @@ type RXQueueDevice struct {
 	OriginalHostAlias string         `json:"originalHostAlias,omitempty"`
 	PhysicalQueueID   uint32         `json:"physicalQueueID,omitempty"`
 	VirtualQueueID    uint32         `json:"virtualQueueID,omitempty"`
+	rxFlows           []rxFlowState
 	reservations      *queueReservations
 
 	mu sync.Mutex
@@ -537,6 +546,10 @@ func validateAllocation(allocation types.DeviceAllocation) error {
 	return nil
 }
 
+func ownershipAlias(owner string) string {
+	return ownershipPrefix + owner
+}
+
 func netlinkNetDevQueueGetByName(ifName string, queueID uint32) (*netlink.NetDevQueue, error) {
 	link, err := netlinkLinkByName(ifName)
 	if err != nil {
@@ -579,6 +592,29 @@ func (d *RXQueueDevice) Free(allocation types.DeviceAllocation) error {
 		return fmt.Errorf("%w: %s/%d", errActiveLease, d.PhysicalIfName, d.PhysicalQueueID)
 	}
 
+	locations := ownershipFromFlowStates(d.rxFlows).locations
+	var host netlink.Link
+	if d.HostIfName != "" {
+		host, err = netlinkLinkByName(d.HostIfName)
+		if err != nil && !errors.As(err, &netlink.LinkNotFoundError{}) {
+			return fmt.Errorf("failed to find Pod netkit host %s: %w", d.HostIfName, err)
+		}
+		if err == nil {
+			ownership, ownershipErr := ownedRXFlows(host, string(d.ShareID), d.OriginalHostAlias)
+			if ownershipErr != nil {
+				return ownershipErr
+			}
+			locations = ownership.locations
+		}
+	}
+	if err := deleteRXFlows(d.PhysicalIfName, locations); err != nil {
+		return fmt.Errorf("failed to delete RX flow rules for %s: %w", d.PhysicalIfName, err)
+	}
+	if host != nil && strings.HasPrefix(host.Attrs().Alias, ownershipAlias(string(d.ShareID))) {
+		if err := netlinkLinkSetAlias(host, d.OriginalHostAlias); err != nil {
+			return fmt.Errorf("failed to restore alias on Pod netkit host %s: %w", d.HostIfName, err)
+		}
+	}
 	d.releaseReservation()
 	return nil
 }

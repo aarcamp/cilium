@@ -665,6 +665,7 @@ type deviceState struct {
 	OriginalHostAlias string         `json:"originalHostAlias,omitempty"`
 	PhysicalQueueID   uint32         `json:"physicalQueueID,omitempty"`
 	VirtualQueueID    uint32         `json:"virtualQueueID,omitempty"`
+	RXFlows           []rxFlowState  `json:"rxFlows,omitempty"`
 }
 
 func (d *RXQueueDevice) MarshalBinary() ([]byte, error) {
@@ -682,6 +683,7 @@ func (d *RXQueueDevice) MarshalBinary() ([]byte, error) {
 		OriginalHostAlias: d.OriginalHostAlias,
 		PhysicalQueueID:   d.PhysicalQueueID,
 		VirtualQueueID:    d.VirtualQueueID,
+		RXFlows:           slices.Clone(d.rxFlows),
 	})
 }
 
@@ -702,6 +704,33 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	if state.Bound && (!state.Prepared || state.HostIfName == "") {
 		return errors.New("bound RX queue device is missing its Pod netkit host name")
 	}
+	if !state.Bound && len(state.RXFlows) != 0 {
+		return errors.New("unbound RX queue device contains RX flow rules")
+	}
+	if !state.Prepared && len(state.RXFlows) != 0 {
+		return errors.New("unprepared RX queue device contains RX flow rules")
+	}
+	if len(state.RXFlows) != 0 {
+		flows := make([]types.RXQueueFlow, 0, len(state.RXFlows))
+		locations := make(map[uint32]struct{}, len(state.RXFlows))
+		for _, flow := range state.RXFlows {
+			if flow.Location >= netlink.RX_CLS_LOC_LAST {
+				return fmt.Errorf("RX flow location %d is invalid", flow.Location)
+			}
+			if _, exists := locations[flow.Location]; exists {
+				return fmt.Errorf("RX flow location %d is duplicated", flow.Location)
+			}
+			locations[flow.Location] = struct{}{}
+			flows = append(flows, flow.Flow)
+		}
+		normalized, err := normalizeRXFlows(flows)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(normalized, flows) {
+			return errors.New("RX flow rules are not in canonical order")
+		}
+	}
 
 	d.PhysicalIfName = state.PhysicalIfName
 	d.HardwareAddress = state.HardwareAddress
@@ -716,5 +745,6 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	d.OriginalHostAlias = state.OriginalHostAlias
 	d.PhysicalQueueID = state.PhysicalQueueID
 	d.VirtualQueueID = state.VirtualQueueID
+	d.rxFlows = slices.Clone(state.RXFlows)
 	return nil
 }

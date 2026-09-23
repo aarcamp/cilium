@@ -85,6 +85,11 @@ func TestSetRXQueueFlows(t *testing.T) {
 		flows[1],
 		flows[0],
 	}), ownership.digest)
+	data, err := programmed.MarshalBinary()
+	require.NoError(t, err)
+	restoredDevice, err := (&RXQueueManager{}).RestoreDevice(data)
+	require.NoError(t, err)
+	require.Equal(t, programmed.rxFlows, restoredDevice.(*RXQueueDevice).rxFlows)
 
 	_, err = programmed.SetRXQueueFlows([]types.RXQueueFlow{flows[0], flows[1]})
 	require.NoError(t, err)
@@ -133,4 +138,40 @@ func TestSetRXQueueFlowsRollsBack(t *testing.T) {
 	require.Empty(t, fake.flows)
 	require.Equal(t, []uint32{100}, fake.flowDeleteCalls)
 	require.Equal(t, prepared.OriginalHostAlias, fake.links[fake.hostIfName].Attrs().Alias)
+}
+
+func TestRestoreRXQueueFlows(t *testing.T) {
+	fake := newFakeNetlink(8, 8, testShareID)
+	fake.install(t)
+	prepared := prepareTestRXQueue(t, fake)
+	flows := testRXFlows()[:1]
+
+	device, err := prepared.SetRXQueueFlows(flows)
+	require.NoError(t, err)
+	data, err := device.MarshalBinary()
+	require.NoError(t, err)
+	restoredDevice, err := (&RXQueueManager{}).RestoreDevice(data)
+	require.NoError(t, err)
+
+	recoveredDevice, err := restoredDevice.Recover(testAllocation(testShareID))
+	require.NoError(t, err)
+	recovered := recoveredDevice.(*RXQueueDevice)
+	require.Equal(t, flows[0], recovered.rxFlows[0].Flow)
+	require.Equal(t, uint32(100), recovered.rxFlows[0].Location)
+
+	reconciled, err := recovered.SetRXQueueFlows(flows)
+	require.NoError(t, err)
+	require.Equal(t, recovered.rxFlows, reconciled.(*RXQueueDevice).rxFlows)
+	require.Len(t, fake.flowInsertCalls, 1)
+
+	fake.links[fake.hostIfName].Attrs().Alias = "foreign-alias"
+	require.ErrorIs(t, recovered.Free(testAllocation(testShareID)), errUnownedLink)
+	fake.links[fake.hostIfName].Attrs().Alias = rxFlowOwnershipAlias(
+		string(testShareID),
+		ownershipFromFlowStates(recovered.rxFlows),
+	)
+	require.NoError(t, recovered.Free(testAllocation(testShareID)))
+	require.Empty(t, fake.flows)
+	require.Contains(t, fake.links, fake.hostIfName)
+	require.Equal(t, recovered.OriginalHostAlias, fake.links[fake.hostIfName].Attrs().Alias)
 }

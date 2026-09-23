@@ -767,6 +767,12 @@ func (e *Endpoint) HostInterface() string {
 	return e.ifName
 }
 
+// ContainerInterface returns the name of the link-layer interface in the
+// endpoint's network namespace.
+func (e *Endpoint) ContainerInterface() string {
+	return e.containerIfName
+}
+
 // GetOpLabels returns the labels as slice
 func (e *Endpoint) GetOpLabels() []string {
 	e.unconditionalRLock()

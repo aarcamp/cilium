@@ -17,6 +17,7 @@ import (
 	kube_types "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 
+	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -41,6 +42,7 @@ var Cell = cell.Module(
 		ciliumNetworkDriverConfigResource,
 		resourceClaimResource,
 		podResource,
+		networkDriverServiceResource,
 		newDeviceTable,
 		newAllocationTable,
 	),
@@ -74,6 +76,8 @@ type networkDriverParams struct {
 	Configs         resource.Resource[*v2alpha1.CiliumNetworkDriverNodeConfig]
 	ResourceClaims  resource.Resource[*resourceapi.ResourceClaim]
 	Pods            resource.Resource[*corev1.Pod]
+	Services        resource.Resource[*corev1.Service]
+	EndpointManager endpointmanager.EndpointManager
 	DaemonCfg       *option.DaemonConfig
 	DB              *statedb.DB
 	DeviceTable     statedb.RWTable[*DRADevice]
@@ -134,24 +138,46 @@ func podResource(
 	), nil
 }
 
+// RX queue Service selectors need targetPort, which is not retained in the
+// slim Service type used by Cilium's shared service cache.
+func networkDriverServiceResource(
+	lc cell.Lifecycle,
+	cs k8sClient.Clientset,
+	mp workqueue.MetricsProvider,
+	cfg NetworkDriverConfig,
+) (resource.Resource[*corev1.Service], error) {
+	if !cs.IsEnabled() || !cfg.Enabled {
+		return nil, nil
+	}
+	lw := utils.ListerWatcherWithModifiers(
+		utils.ListerWatcherFromTyped(cs.CoreV1().Services("")),
+	)
+	return resource.New[*corev1.Service](lc, lw, mp,
+		resource.WithMetric("NetworkDriverService"),
+	), nil
+}
+
 func registerNetworkDriver(params networkDriverParams) *Driver {
 	if !params.CellCfg.Enabled {
 		return nil
 	}
 
 	driver := &Driver{
-		logger:          params.Log,
-		jg:              params.JobGroup,
-		resourceClaims:  params.ResourceClaims,
-		pods:            params.Pods,
-		kubeClient:      params.ClientSet,
-		deviceManagers:  make(map[types.DeviceManagerType]types.DeviceManager),
-		configCRD:       params.Configs,
-		podNetns:        make(map[kube_types.UID]string),
-		db:              params.DB,
-		deviceTable:     params.DeviceTable,
-		allocationTable: params.AllocationTable,
-		localNodeStore:  params.LocalNodeStore,
+		logger:           params.Log,
+		jg:               params.JobGroup,
+		resourceClaims:   params.ResourceClaims,
+		pods:             params.Pods,
+		services:         params.Services,
+		endpointManager:  params.EndpointManager,
+		kubeClient:       params.ClientSet,
+		deviceManagers:   make(map[types.DeviceManagerType]types.DeviceManager),
+		configCRD:        params.Configs,
+		podNetns:         make(map[kube_types.UID]string),
+		db:               params.DB,
+		deviceTable:      params.DeviceTable,
+		allocationTable:  params.AllocationTable,
+		localNodeStore:   params.LocalNodeStore,
+		rxQueueReconcile: make(chan struct{}, 1),
 	}
 
 	params.Lifecycle.Append(driver)

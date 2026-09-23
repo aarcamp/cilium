@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/util/retry"
 
 	"github.com/cilium/cilium/pkg/endpoint"
+	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/networkdriver/types"
@@ -27,6 +28,8 @@ import (
 
 type rxQueueEndpointManager interface {
 	GetEndpointsByPodName(string) []*endpoint.Endpoint
+	Subscribe(endpointmanager.Subscriber)
+	Unsubscribe(endpointmanager.Subscriber)
 }
 
 type rxQueuePodStore interface {

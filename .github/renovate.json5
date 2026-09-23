@@ -370,6 +370,14 @@
       ]
     },
     {
+      // Signing a >1100-file vendor commit through the GitHub API times out.
+      "platformCommit": "disabled",
+      "matchFileNames": [
+        "go.mod",
+        "go.sum"
+      ]
+    },
+    {
       // Avoid updating patch releases of golang in go.mod
       "enabled": false,
       "matchFileNames": [
@@ -1154,7 +1162,7 @@
       ],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)\\s+.+_VERSION=\"(?<currentValue>.*)\"",
-        "# renovate: datasource=(?<datasource>.*?)\\s+KIND_K8S_IMAGE=\"(?<depName>.*):(?<currentValue>.*)@(?<currentDigest>sha256:[a-f0-9]+)\""
+        "# renovate: datasource=(?<datasource>.*?)\\s+.*_IMAGE=\"(?<depName>.*):(?<currentValue>.*)@(?<currentDigest>sha256:[a-f0-9]+)\""
       ]
     },
     {

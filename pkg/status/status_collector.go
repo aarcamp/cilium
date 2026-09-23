@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strings"
 
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
 	"github.com/go-openapi/strfmt"
 	versionapi "k8s.io/apimachinery/pkg/version"
 
@@ -39,6 +42,8 @@ import (
 type StatusCollector interface {
 	GetStatus(brief bool, requireK8sConnectivity bool) models.StatusResponse
 }
+
+var titleCaser = cases.Title(language.English, cases.NoLower)
 
 type statusCollector struct {
 	statusCollectMutex lock.RWMutex
@@ -328,7 +333,7 @@ func (d *statusCollector) getKubeProxyReplacementStatus(ctx context.Context) *mo
 		}
 		if d.statusParams.LBConfig.LBMode == loadbalancer.LBModeHybrid {
 			//nolint:staticcheck
-			features.NodePort.Mode = strings.Title(d.statusParams.LBConfig.LBMode)
+			features.NodePort.Mode = titleCaser.String(d.statusParams.LBConfig.LBMode)
 		}
 		features.NodePort.Algorithm = models.KubeProxyReplacementFeaturesNodePortAlgorithmRandom
 		if d.statusParams.LBConfig.LBAlgorithm == loadbalancer.LBAlgorithmMaglev {
@@ -341,7 +346,7 @@ func (d *statusCollector) getKubeProxyReplacementStatus(ctx context.Context) *mo
 		if d.statusParams.DaemonConfig.NodePortAcceleration == option.NodePortAccelerationGeneric {
 			features.NodePort.Acceleration = models.KubeProxyReplacementFeaturesNodePortAccelerationGeneric
 		} else {
-			features.NodePort.Acceleration = strings.Title(d.statusParams.DaemonConfig.NodePortAcceleration)
+			features.NodePort.Acceleration = titleCaser.String(d.statusParams.DaemonConfig.NodePortAcceleration)
 		}
 		features.NodePort.PortMin = int64(d.statusParams.LBConfig.NodePortMin)
 		features.NodePort.PortMax = int64(d.statusParams.LBConfig.NodePortMax)
@@ -412,10 +417,6 @@ func (d *statusCollector) getBPFMapStatus() *models.BPFMapStatus {
 	return &models.BPFMapStatus{
 		DynamicSizeRatio: d.statusParams.DaemonConfig.BPFMapsDynamicSizeRatio,
 		Maps: []*models.BPFMapProperties{
-			{
-				Name: "Auth",
-				Size: int64(d.statusParams.DaemonConfig.AuthMapEntries),
-			},
 			{
 				Name: "Non-TCP connection tracking",
 				Size: int64(d.statusParams.DaemonConfig.CTMapEntriesGlobalAny),
@@ -950,26 +951,6 @@ func (d *statusCollector) getProbes() []Probe {
 				if status.Err == nil {
 					if s, ok := status.Data.(*models.KubeProxyReplacement); ok {
 						d.statusResponse.KubeProxyReplacement = s
-					}
-				}
-			},
-		},
-		{
-			Name: "auth-cert-provider",
-			Probe: func(ctx context.Context) (any, error) {
-				if d.statusParams.AuthManager == nil {
-					return &models.Status{State: models.StatusStateDisabled}, nil
-				}
-
-				return d.statusParams.AuthManager.CertProviderStatus(), nil
-			},
-			OnStatusUpdate: func(status Status) {
-				d.statusCollectMutex.Lock()
-				defer d.statusCollectMutex.Unlock()
-
-				if status.Err == nil {
-					if s, ok := status.Data.(*models.Status); ok {
-						d.statusResponse.AuthCertificateProvider = s
 					}
 				}
 			},

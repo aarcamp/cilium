@@ -17,7 +17,6 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/ipam/podippool"
-	"github.com/cilium/cilium/pkg/ipmasq"
 	"github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -33,12 +32,6 @@ type AllocationResult struct {
 
 	// IPPoolName is the IPAM pool from which the above IP was allocated from
 	IPPoolName Pool
-
-	// CIDRs is a list of all CIDRs to which the IP has direct access to.
-	// This is primarily useful if the IP has been allocated out of a VPC
-	// subnet range and the VPC provides routing to a set of CIDRs in which
-	// the IP is routable.
-	CIDRs []netip.Prefix
 
 	// PrimaryMAC is the MAC address of the primary interface. This is useful
 	// when the IP is a secondary address of an interface which is
@@ -136,7 +129,6 @@ type IPAM struct {
 	clientset      client.Clientset
 	nodeDiscovery  Owner
 	sysctl         sysctl.Sysctl
-	ipMasqAgent    *ipmasq.IPMasqAgent
 
 	jg job.Group
 

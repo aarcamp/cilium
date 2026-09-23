@@ -48,6 +48,8 @@ PerCPU
 RevNAT
 RSS
 SAddr
+SCTP
+SIP
 SNAT
 SPI
 SPort

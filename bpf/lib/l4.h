@@ -111,10 +111,6 @@ l4_rewrite_port_and_csum(struct __ctx_buff *ctx, __u8 nexthdr, int l4_off, int p
 		case IPPROTO_UDP:
 		case IPPROTO_ICMPV6:
 			break;
-#ifdef ENABLE_SCTP
-		case IPPROTO_SCTP:
-			return DROP_CSUM_L4;
-#endif  /* ENABLE_SCTP */
 		case IPPROTO_ICMP:
 			/* Not initialized by csum_l4_offset_and_flags(), because ICMPv4
 			 * doesn't use a pseudo-header, and the change in IP addresses is
@@ -123,6 +119,10 @@ l4_rewrite_port_and_csum(struct __ctx_buff *ctx, __u8 nexthdr, int l4_off, int p
 			 */
 			csum.offset = offsetof(struct icmphdr, checksum);
 			break;
+		case IPPROTO_SCTP:
+			if (CONFIG(enable_sctp))
+				return DROP_CSUM_L4;
+			fallthrough;
 		default:
 			return DROP_UNKNOWN_L4;
 		}
@@ -168,6 +168,17 @@ static __always_inline int l4_load_tcp_flags(const struct __ctx_buff *ctx, int l
 					     union tcp_flags *flags)
 {
 	return ctx_load_bytes(ctx, l4_off + 12, flags, 2);
+}
+
+static __always_inline int
+l4_load_tcp_hdrlen(const struct __ctx_buff *ctx, int l4_off, __u32 *hdrlen)
+{
+	__u8 doff;
+
+	if (ctx_load_bytes(ctx, l4_off + 12, &doff, sizeof(doff)) < 0)
+		return DROP_INVALID;
+	*hdrlen = (doff & 0xf0) >> 2;
+	return 0;
 }
 
 /* A non-first fragment from the world whose first fragment (with the L4 ports)

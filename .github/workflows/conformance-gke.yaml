@@ -106,7 +106,7 @@ env:
   clusterName: ${{ github.event.repository.name }}-${{ github.run_id }}-${{ inputs.UID }}-${{ github.run_attempt }}
   USE_GKE_GCLOUD_AUTH_PLUGIN: True
   # renovate: datasource=docker depName=google/cloud-sdk
-  gcloud_version: 584.0.0
+  gcloud_version: 585.0.0
 
 jobs:
   echo-inputs:
@@ -348,7 +348,10 @@ jobs:
             --wait=false"
 
           if [[ ${{ matrix.config.type }} == "tunnel" ]]; then
-            CILIUM_INSTALL_DEFAULTS+=" --datapath-mode=tunnel"
+            # Keep using GKE's alias-IP PodCIDRs in tunnel mode. Cluster-pool
+            # IPAM allocates unrelated 10.0.x.0/24 ranges which GCE cannot
+            # route from the nodes without Cilium.
+            CILIUM_INSTALL_DEFAULTS+=" --datapath-mode=tunnel --helm-set=ipam.mode=kubernetes"
           fi
 
           if [[ "${{ matrix.config.ipsec }}" == "true" ]]; then
@@ -528,6 +531,7 @@ jobs:
           external-target-ca-name: custom-ca
           external-target-fake-dns: true
           hubble: false
+          include-unsafe-tests: true
           test-concurrency: 5
 
       - name: Set up job variables for connectivity tests

@@ -184,10 +184,6 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *config.Config) erro
 		}
 	}
 
-	if option.Config.EnableSCTP {
-		cDefinesMap["ENABLE_SCTP"] = "1"
-	}
-
 	// --- WARNING: THIS CONFIGURATION METHOD IS DEPRECATED, SEE FUNCTION DOC ---
 
 	if option.Config.EnableEnvoyConfig {
@@ -209,9 +205,6 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *config.Config) erro
 	cDefinesMap["NODEPORT_NEIGH4_SIZE"] = fmt.Sprintf("%d", option.Config.NeighMapEntriesGlobal)
 
 	if h.kprCfg.KubeProxyReplacement {
-		if option.Config.UnsafeDaemonConfigOption.EnableHealthDatapath {
-			cDefinesMap["ENABLE_HEALTH_CHECK"] = "1"
-		}
 		cDefinesMap["ENABLE_NODEPORT"] = "1"
 
 		if option.Config.EnableNat46X64Gateway {
@@ -375,9 +368,6 @@ func (h *HeaderfileWriter) writeTemplateConfig(fw *bufio.Writer, e endpoint.Conf
 	if e.RequireRouting() {
 		fmt.Fprintf(fw, "#define ENABLE_ROUTING 1\n")
 	}
-
-	// Local delivery metrics should always be set for endpoint programs.
-	fmt.Fprint(fw, "#define LOCAL_DELIVERY_METRICS 1\n")
 
 	h.writeNetdevConfig(fw, e.GetOptions())
 

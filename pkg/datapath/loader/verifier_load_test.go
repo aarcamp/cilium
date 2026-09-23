@@ -34,6 +34,7 @@ func setBasePermutations(t *config.Node) {
 	t.DebugLB = true
 	t.EventsMapRateLimit = 1000
 	t.EnableIdentityMark = true
+	t.EnableSCTP = true
 }
 
 func baseLXCPermutations() *loadPermutationBuilder {
@@ -51,6 +52,7 @@ func baseLXCPermutations() *loadPermutationBuilder {
 			t.EnableNetkit = false
 			t.EnableVTEP = true
 			t.EnableServiceNoBackendResponse = true
+			t.EnableSIPVerification = true
 		}),
 
 		Increment(func(t *config.BPFLXC, v bool) { t.Node.PolicyDenyResponseEnabled = v }),

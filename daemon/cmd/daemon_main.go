@@ -65,6 +65,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/pidfile"
 	"github.com/cilium/cilium/pkg/policy"
+	policycompute "github.com/cilium/cilium/pkg/policy/compute"
 	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/version"
@@ -561,9 +562,6 @@ func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 
 	flags.Bool(option.PreAllocateMapsName, defaults.PreAllocateMaps, "Enable BPF map pre-allocation")
 	option.BindEnv(vp, option.PreAllocateMapsName)
-
-	flags.Int(option.AuthMapEntriesName, option.AuthMapEntriesDefault, "Maximum number of entries in auth map")
-	option.BindEnv(vp, option.AuthMapEntriesName)
 
 	flags.Int(option.CTMapEntriesGlobalTCPName, option.CTMapEntriesGlobalTCPDefault, "Maximum number of entries in TCP CT table")
 	option.BindEnvWithLegacyEnvFallback(vp, option.CTMapEntriesGlobalTCPName, "CILIUM_GLOBAL_CT_MAX_TCP")
@@ -1187,6 +1185,7 @@ type daemonParams struct {
 	EndpointRestorer    *endpointRestorer
 	IdentityAllocator   identitycell.CachingIdentityAllocator
 	Policy              policy.PolicyRepository
+	PolicyComputer      policycompute.PolicyRecomputer
 	MonitorAgent        monitorAgent.Agent
 	DB                  *statedb.DB
 	Devices             statedb.Table[*datapathTables.Device]

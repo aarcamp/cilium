@@ -22,8 +22,8 @@ import (
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/daemon/restapi"
 	"github.com/cilium/cilium/pkg/api"
-	"github.com/cilium/cilium/pkg/auth"
 	awsAgent "github.com/cilium/cilium/pkg/aws/agent"
+	azureAgent "github.com/cilium/cilium/pkg/azure/agent"
 	"github.com/cilium/cilium/pkg/bgp"
 	bgpagent "github.com/cilium/cilium/pkg/bgp/agent"
 	bgpConfig "github.com/cilium/cilium/pkg/bgp/config"
@@ -312,9 +312,6 @@ var (
 		// Brokers datapath signals from signalmap
 		signal.Cell,
 
-		// Auth is responsible for authenticating a request if required by a policy.
-		auth.Cell,
-
 		// Provides Identity Controlplane (Responsible for allocating & managing security identities)
 		identity.Cell,
 
@@ -326,6 +323,9 @@ var (
 
 		// Provides the AWS ENI customization of the multi-pool IPAM allocator.
 		awsAgent.Cell,
+
+		// Provides the Azure customization of the multi-pool IPAM allocator.
+		azureAgent.Cell,
 
 		// Egress Gateway allows originating traffic from specific IPv4 addresses.
 		egressgateway.Cell,

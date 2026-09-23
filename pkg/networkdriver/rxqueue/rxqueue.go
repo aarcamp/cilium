@@ -45,17 +45,20 @@ var (
 	errInvalidAllocation    = errors.New("invalid RX queue allocation")
 	errUnownedLink          = errors.New("refusing to use link not owned by the RX queue manager")
 
-	netlinkLinkByName        = safenetlink.LinkByName
-	netlinkLinkAdd           = netlink.LinkAdd
-	netlinkLinkDel           = netlink.LinkDel
-	netlinkLinkSetAlias      = netlink.LinkSetAlias
-	netlinkLinkSetUp         = netlink.LinkSetUp
-	netlinkNetDevQueueGet    = netlink.NetDevQueueGet
-	netlinkNetDevQueueCreate = netlink.NetDevQueueCreate
-	netlinkNetDevRSSGet      = netlink.NetDevRSSGet
-	netlinkNetDevRSSSet      = netlink.NetDevRSSSet
-	netlinkNetDevRingsGet    = netlink.NetDevRingsGet
-	netlinkNetDevRingsSet    = netlink.NetDevRingsSet
+	netlinkLinkByName         = safenetlink.LinkByName
+	netlinkLinkAdd            = netlink.LinkAdd
+	netlinkLinkDel            = netlink.LinkDel
+	netlinkLinkSetAlias       = netlink.LinkSetAlias
+	netlinkLinkSetUp          = netlink.LinkSetUp
+	netlinkNetDevQueueGet     = netlink.NetDevQueueGet
+	netlinkNetDevQueueCreate  = netlink.NetDevQueueCreate
+	netlinkNetDevRSSGet       = netlink.NetDevRSSGet
+	netlinkNetDevRSSSet       = netlink.NetDevRSSSet
+	netlinkNetDevRingsGet     = netlink.NetDevRingsGet
+	netlinkNetDevRingsSet     = netlink.NetDevRingsSet
+	netlinkNetDevRxFlowInsert = netlink.NetDevRxFlowInsert
+	netlinkNetDevRxFlowDelete = netlink.NetDevRxFlowDelete
+	netlinkNetDevRxFlowList   = netlink.NetDevRxFlowList
 )
 
 type RXQueueManager struct {
@@ -446,6 +449,7 @@ type RXQueueDevice struct {
 	PeerIfName      string `json:"peerIfName,omitempty"`
 	PhysicalQueueID uint32 `json:"physicalQueueID,omitempty"`
 	VirtualQueueID  uint32 `json:"virtualQueueID,omitempty"`
+	rxFlows         []rxFlowState
 
 	mu sync.Mutex
 }
@@ -593,7 +597,8 @@ func (d *RXQueueDevice) adoptExisting(
 		}
 		return nil, false, fmt.Errorf("failed to inspect existing host link %s: %w", hostIfName, err)
 	}
-	if err := validateOwnedNetkit(host, ownershipAlias(hostIfName)); err != nil {
+	flowOwnership, err := ownedRXFlows(host, hostIfName)
+	if err != nil {
 		return nil, true, err
 	}
 
@@ -623,23 +628,22 @@ func (d *RXQueueDevice) adoptExisting(
 			return nil, true, err
 		}
 		if leaseMatches(queue.Lease, peer.Attrs().Index) {
-			return d.prepared(hostIfName, peerIfName, physicalQueueID, queue.Lease.Queue.ID), true, nil
+			prepared := d.prepared(hostIfName, peerIfName, physicalQueueID, queue.Lease.Queue.ID)
+			prepared.rxFlows = slices.Clone(d.rxFlows)
+			return prepared, true, nil
 		}
 	}
 
 	// A prior setup stopped after creating the pair but before creating its
 	// lease. Remove the manager-owned partial state and let setup start again.
+	if err := deleteRXFlows(d.PhysicalIfName, flowOwnership.locations); err != nil {
+		return nil, true, fmt.Errorf("failed to clean up RX flow rules for incomplete netkit host %s: %w",
+			hostIfName, err)
+	}
 	if err := netlinkLinkDel(host); err != nil {
 		return nil, true, fmt.Errorf("failed to clean up incomplete netkit host %s: %w", hostIfName, err)
 	}
 	return nil, false, nil
-}
-
-func validateOwnedNetkit(link netlink.Link, wantAlias string) error {
-	if _, ok := link.(*netlink.Netkit); !ok || link.Attrs().Alias != wantAlias {
-		return fmt.Errorf("%w: %s", errUnownedLink, link.Attrs().Name)
-	}
-	return nil
 }
 
 func (d *RXQueueDevice) createLease(
@@ -781,6 +785,9 @@ func (d *RXQueueDevice) prepared(
 }
 
 func (d *RXQueueDevice) Free(allocation types.DeviceAllocation) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	if !d.Prepared || d.HostIfName == "" {
 		return nil
 	}
@@ -796,12 +803,19 @@ func (d *RXQueueDevice) Free(allocation types.DeviceAllocation) error {
 	host, err := netlinkLinkByName(d.HostIfName)
 	if err != nil {
 		if errors.As(err, &netlink.LinkNotFoundError{}) {
-			return nil
+			return deleteRXFlows(d.PhysicalIfName, ownershipFromFlowStates(d.rxFlows).locations)
 		}
 		return fmt.Errorf("failed to find netkit host %s: %w", d.HostIfName, err)
 	}
-	if err := validateOwnedNetkit(host, ownershipAlias(d.HostIfName)); err != nil {
+	flowOwnership, err := ownedRXFlows(host, d.HostIfName)
+	if err != nil {
 		return err
+	}
+	if err := deleteRXFlows(d.PhysicalIfName, flowOwnership.locations); err != nil {
+		return fmt.Errorf("failed to delete RX flow rules for netkit host %s: %w", d.HostIfName, err)
+	}
+	if err := netlinkLinkSetAlias(host, ownershipAlias(d.HostIfName)); err != nil {
+		return fmt.Errorf("failed to clear RX flow ownership on netkit host %s: %w", d.HostIfName, err)
 	}
 	if err := netlinkLinkDel(host); err != nil {
 		return fmt.Errorf("failed to delete netkit host %s: %w", d.HostIfName, err)

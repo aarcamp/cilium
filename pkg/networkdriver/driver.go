@@ -58,6 +58,8 @@ type Driver struct {
 	resourceClaims resource.Resource[*resourceapi.ResourceClaim]
 	pods           resource.Resource[*corev1.Pod]
 
+	endpointManager rxQueueEndpointManager
+
 	configCRD resource.Resource[*v2alpha1.CiliumNetworkDriverNodeConfig]
 	config    *v2alpha1.CiliumNetworkDriverNodeConfigSpec
 
@@ -505,8 +507,8 @@ func (driver *Driver) deleteAllocations(allocs []allocation) {
 	}
 }
 
-// updateAllocationDevice replaces a prepared device that NRI recovered on
-// demand after a reboot.
+// updateAllocationDevice replaces a prepared device after its allocation-
+// specific kernel state changes.
 func (driver *Driver) updateAllocationDevice(a allocation) {
 	if a.Device == nil || a.DeviceName == "" || a.Pool == "" {
 		return

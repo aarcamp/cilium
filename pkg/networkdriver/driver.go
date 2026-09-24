@@ -57,11 +57,11 @@ type Driver struct {
 	jg             job.Group
 	resourceClaims resource.Resource[*resourceapi.ResourceClaim]
 	pods           resource.Resource[*corev1.Pod]
+	services       resource.Resource[*corev1.Service]
 
 	endpointManager rxQueueEndpointManager
-
-	configCRD resource.Resource[*v2alpha1.CiliumNetworkDriverNodeConfig]
-	config    *v2alpha1.CiliumNetworkDriverNodeConfigSpec
+	configCRD       resource.Resource[*v2alpha1.CiliumNetworkDriverNodeConfig]
+	config          *v2alpha1.CiliumNetworkDriverNodeConfigSpec
 
 	deviceManagers map[types.DeviceManagerType]types.DeviceManager
 	// pod.UID: network namespace path. Captured at RunPodSandbox (and rebuilt on
@@ -76,6 +76,8 @@ type Driver struct {
 	deviceTable     statedb.RWTable[*DRADevice]
 	allocationTable statedb.RWTable[*DRAAllocation]
 	localNodeStore  *node.LocalNodeStore
+
+	rxQueueReconcile chan struct{}
 }
 
 type allocation struct {
@@ -288,6 +290,18 @@ func (driver *Driver) Start(ctx cell.HookContext) error {
 			return err
 		}
 
+		if _, enabled := driver.deviceManagers[types.DeviceManagerTypeRXQueue]; enabled {
+			driver.endpointManager.Subscribe(driver)
+			driver.jg.Add(job.OneShot(
+				"network-driver-rx-queue-resource-events",
+				driver.runRXQueueResourceEvents,
+			))
+			driver.jg.Add(job.OneShot(
+				"network-driver-rx-queue-flow-reconciliation",
+				driver.runRXQueueFlowReconciliation,
+			))
+		}
+
 		// Publish loop: re-publish ResourceSlices whenever inventory or
 		// allocation state changes.
 		driver.jg.Add(job.OneShot(
@@ -315,6 +329,10 @@ func (driver *Driver) Stop(ctx cell.HookContext) error {
 	// Stop DRA plugin
 	if driver.draPlugin != nil {
 		driver.draPlugin.Stop()
+	}
+
+	if driver.endpointManager != nil {
+		driver.endpointManager.Unsubscribe(driver)
 	}
 
 	driver.logger.DebugContext(ctx, "Network driver stopped")

@@ -21,6 +21,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/cilium/cilium/pkg/endpoint"
+	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -51,13 +52,24 @@ func (services *staticRXQueueServices) GetByKey(key resource.Key) (*corev1.Servi
 }
 
 type fakeRXQueueEndpointManager struct {
-	endpoints map[string][]*endpoint.Endpoint
-	lookups   []string
+	endpoints  map[string][]*endpoint.Endpoint
+	lookups    []string
+	subscriber endpointmanager.Subscriber
 }
 
 func (manager *fakeRXQueueEndpointManager) GetEndpointsByPodName(name string) []*endpoint.Endpoint {
 	manager.lookups = append(manager.lookups, name)
 	return manager.endpoints[name]
+}
+
+func (manager *fakeRXQueueEndpointManager) Subscribe(subscriber endpointmanager.Subscriber) {
+	manager.subscriber = subscriber
+}
+
+func (manager *fakeRXQueueEndpointManager) Unsubscribe(subscriber endpointmanager.Subscriber) {
+	if manager.subscriber == subscriber {
+		manager.subscriber = nil
+	}
 }
 
 type reconcileFlowDevice struct {

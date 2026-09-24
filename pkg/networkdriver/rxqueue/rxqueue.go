@@ -45,17 +45,20 @@ var (
 	errInvalidAllocation    = errors.New("invalid RX queue allocation")
 	errUnownedLink          = errors.New("refusing to use link not owned by the RX queue manager")
 
-	netlinkLinkByName        = safenetlink.LinkByName
-	netlinkLinkAdd           = netlink.LinkAdd
-	netlinkLinkDel           = netlink.LinkDel
-	netlinkLinkSetAlias      = netlink.LinkSetAlias
-	netlinkLinkSetUp         = netlink.LinkSetUp
-	netlinkNetDevQueueGet    = netlink.NetDevQueueGet
-	netlinkNetDevQueueCreate = netlink.NetDevQueueCreate
-	netlinkNetDevRSSGet      = netlink.NetDevRSSGet
-	netlinkNetDevRSSSet      = netlink.NetDevRSSSet
-	netlinkNetDevRingsGet    = netlink.NetDevRingsGet
-	netlinkNetDevRingsSet    = netlink.NetDevRingsSet
+	netlinkLinkByName         = safenetlink.LinkByName
+	netlinkLinkAdd            = netlink.LinkAdd
+	netlinkLinkDel            = netlink.LinkDel
+	netlinkLinkSetAlias       = netlink.LinkSetAlias
+	netlinkLinkSetUp          = netlink.LinkSetUp
+	netlinkNetDevQueueGet     = netlink.NetDevQueueGet
+	netlinkNetDevQueueCreate  = netlink.NetDevQueueCreate
+	netlinkNetDevRSSGet       = netlink.NetDevRSSGet
+	netlinkNetDevRSSSet       = netlink.NetDevRSSSet
+	netlinkNetDevRingsGet     = netlink.NetDevRingsGet
+	netlinkNetDevRingsSet     = netlink.NetDevRingsSet
+	netlinkNetDevRxFlowInsert = netlink.NetDevRxFlowInsert
+	netlinkNetDevRxFlowDelete = netlink.NetDevRxFlowDelete
+	netlinkNetDevRxFlowList   = netlink.NetDevRxFlowList
 )
 
 type RXQueueManager struct {
@@ -446,6 +449,7 @@ type RXQueueDevice struct {
 	PeerIfName      string `json:"peerIfName,omitempty"`
 	PhysicalQueueID uint32 `json:"physicalQueueID,omitempty"`
 	VirtualQueueID  uint32 `json:"virtualQueueID,omitempty"`
+	rxFlows         []rxFlowState
 
 	mu sync.Mutex
 }
@@ -518,6 +522,24 @@ func (d *RXQueueDevice) Recover(allocation types.DeviceAllocation) (types.Device
 				fmt.Errorf("failed to clean up recovered RX queue device: %w", cleanupErr))
 		}
 		return nil, recoveryErr
+	}
+
+	recovered.rxFlows = slices.Clone(d.rxFlows)
+	if len(d.rxFlows) != 0 {
+		flows := make([]types.RXQueueFlow, 0, len(d.rxFlows))
+		for _, flow := range d.rxFlows {
+			flows = append(flows, flow.Flow)
+		}
+		device, err := recovered.SetRXQueueFlows(flows)
+		if err != nil {
+			recoveryErr := fmt.Errorf("failed to recover RX flow rules: %w", err)
+			if cleanupErr := recovered.Free(allocation); cleanupErr != nil {
+				recoveryErr = errors.Join(recoveryErr,
+					fmt.Errorf("failed to clean up recovered RX queue device: %w", cleanupErr))
+			}
+			return nil, recoveryErr
+		}
+		return device, nil
 	}
 
 	return recovered, nil
@@ -593,7 +615,8 @@ func (d *RXQueueDevice) adoptExisting(
 		}
 		return nil, false, fmt.Errorf("failed to inspect existing host link %s: %w", hostIfName, err)
 	}
-	if err := validateOwnedNetkit(host, ownershipAlias(hostIfName)); err != nil {
+	flowOwnership, err := ownedRXFlows(host, hostIfName)
+	if err != nil {
 		return nil, true, err
 	}
 
@@ -623,23 +646,22 @@ func (d *RXQueueDevice) adoptExisting(
 			return nil, true, err
 		}
 		if leaseMatches(queue.Lease, peer.Attrs().Index) {
-			return d.prepared(hostIfName, peerIfName, physicalQueueID, queue.Lease.Queue.ID), true, nil
+			prepared := d.prepared(hostIfName, peerIfName, physicalQueueID, queue.Lease.Queue.ID)
+			prepared.rxFlows = slices.Clone(d.rxFlows)
+			return prepared, true, nil
 		}
 	}
 
 	// A prior setup stopped after creating the pair but before creating its
 	// lease. Remove the manager-owned partial state and let setup start again.
+	if err := deleteRXFlows(d.PhysicalIfName, flowOwnership.locations); err != nil {
+		return nil, true, fmt.Errorf("failed to clean up RX flow rules for incomplete netkit host %s: %w",
+			hostIfName, err)
+	}
 	if err := netlinkLinkDel(host); err != nil {
 		return nil, true, fmt.Errorf("failed to clean up incomplete netkit host %s: %w", hostIfName, err)
 	}
 	return nil, false, nil
-}
-
-func validateOwnedNetkit(link netlink.Link, wantAlias string) error {
-	if _, ok := link.(*netlink.Netkit); !ok || link.Attrs().Alias != wantAlias {
-		return fmt.Errorf("%w: %s", errUnownedLink, link.Attrs().Name)
-	}
-	return nil
 }
 
 func (d *RXQueueDevice) createLease(
@@ -781,6 +803,9 @@ func (d *RXQueueDevice) prepared(
 }
 
 func (d *RXQueueDevice) Free(allocation types.DeviceAllocation) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	if !d.Prepared || d.HostIfName == "" {
 		return nil
 	}
@@ -796,12 +821,19 @@ func (d *RXQueueDevice) Free(allocation types.DeviceAllocation) error {
 	host, err := netlinkLinkByName(d.HostIfName)
 	if err != nil {
 		if errors.As(err, &netlink.LinkNotFoundError{}) {
-			return nil
+			return deleteRXFlows(d.PhysicalIfName, ownershipFromFlowStates(d.rxFlows).locations)
 		}
 		return fmt.Errorf("failed to find netkit host %s: %w", d.HostIfName, err)
 	}
-	if err := validateOwnedNetkit(host, ownershipAlias(d.HostIfName)); err != nil {
+	flowOwnership, err := ownedRXFlows(host, d.HostIfName)
+	if err != nil {
 		return err
+	}
+	if err := deleteRXFlows(d.PhysicalIfName, flowOwnership.locations); err != nil {
+		return fmt.Errorf("failed to delete RX flow rules for netkit host %s: %w", d.HostIfName, err)
+	}
+	if err := netlinkLinkSetAlias(host, ownershipAlias(d.HostIfName)); err != nil {
+		return fmt.Errorf("failed to clear RX flow ownership on netkit host %s: %w", d.HostIfName, err)
 	}
 	if err := netlinkLinkDel(host); err != nil {
 		return fmt.Errorf("failed to delete netkit host %s: %w", d.HostIfName, err)
@@ -842,16 +874,17 @@ func (d *RXQueueDevice) KernelIfName() string {
 func (d *RXQueueDevice) Merge(_ types.Device) {}
 
 type deviceState struct {
-	PhysicalIfName   string   `json:"physicalIfName"`
-	HardwareAddress  string   `json:"hardwareAddress,omitempty"`
-	MTU              int      `json:"mtu,omitempty"`
-	TotalRXQueues    int      `json:"totalRXQueues"`
-	ReservedQueueIDs []uint32 `json:"reservedQueueIDs"`
-	Prepared         bool     `json:"prepared,omitempty"`
-	HostIfName       string   `json:"hostIfName,omitempty"`
-	PeerIfName       string   `json:"peerIfName,omitempty"`
-	PhysicalQueueID  uint32   `json:"physicalQueueID,omitempty"`
-	VirtualQueueID   uint32   `json:"virtualQueueID,omitempty"`
+	PhysicalIfName   string        `json:"physicalIfName"`
+	HardwareAddress  string        `json:"hardwareAddress,omitempty"`
+	MTU              int           `json:"mtu,omitempty"`
+	TotalRXQueues    int           `json:"totalRXQueues"`
+	ReservedQueueIDs []uint32      `json:"reservedQueueIDs"`
+	Prepared         bool          `json:"prepared,omitempty"`
+	HostIfName       string        `json:"hostIfName,omitempty"`
+	PeerIfName       string        `json:"peerIfName,omitempty"`
+	PhysicalQueueID  uint32        `json:"physicalQueueID,omitempty"`
+	VirtualQueueID   uint32        `json:"virtualQueueID,omitempty"`
+	RXFlows          []rxFlowState `json:"rxFlows,omitempty"`
 }
 
 func (d *RXQueueDevice) MarshalBinary() ([]byte, error) {
@@ -866,6 +899,7 @@ func (d *RXQueueDevice) MarshalBinary() ([]byte, error) {
 		PeerIfName:       d.PeerIfName,
 		PhysicalQueueID:  d.PhysicalQueueID,
 		VirtualQueueID:   d.VirtualQueueID,
+		RXFlows:          slices.Clone(d.rxFlows),
 	})
 }
 
@@ -883,6 +917,30 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	if state.Prepared && (state.HostIfName == "" || state.PeerIfName == "") {
 		return errors.New("prepared RX queue device is missing its netkit interface names")
 	}
+	if !state.Prepared && len(state.RXFlows) != 0 {
+		return errors.New("unprepared RX queue device contains RX flow rules")
+	}
+	if len(state.RXFlows) != 0 {
+		flows := make([]types.RXQueueFlow, 0, len(state.RXFlows))
+		locations := make(map[uint32]struct{}, len(state.RXFlows))
+		for _, flow := range state.RXFlows {
+			if flow.Location >= netlink.RX_CLS_LOC_LAST {
+				return fmt.Errorf("RX flow location %d is invalid", flow.Location)
+			}
+			if _, exists := locations[flow.Location]; exists {
+				return fmt.Errorf("RX flow location %d is duplicated", flow.Location)
+			}
+			locations[flow.Location] = struct{}{}
+			flows = append(flows, flow.Flow)
+		}
+		normalized, err := normalizeRXFlows(flows)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(normalized, flows) {
+			return errors.New("RX flow rules are not in canonical order")
+		}
+	}
 
 	d.PhysicalIfName = state.PhysicalIfName
 	d.HardwareAddress = state.HardwareAddress
@@ -894,5 +952,6 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	d.PeerIfName = state.PeerIfName
 	d.PhysicalQueueID = state.PhysicalQueueID
 	d.VirtualQueueID = state.VirtualQueueID
+	d.rxFlows = slices.Clone(state.RXFlows)
 	return nil
 }

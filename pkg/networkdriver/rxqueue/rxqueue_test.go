@@ -43,24 +43,29 @@ func publishedDevices(t *testing.T, mgr *RXQueueManager) []types.Device {
 }
 
 type fakeNetlink struct {
-	links          map[string]netlink.Link
-	leases         map[uint32]*netlink.NetDevQueueLease
-	addedNetkit    *netlink.Netkit
-	createErrors   map[uint32]error
-	createRequests []netlink.NetDevQueueCreateRequest
-	realRXQueues   int
-	rss            netlink.NetDevRSS
-	rings          netlink.NetDevRings
-	rssSetCalls    []netlink.NetDevRSSConfig
-	ringsSetCalls  []netlink.NetDevRingsConfig
-	rssSetError    error
-	ringsSetError  error
-	ignoreRSSSet   bool
-	ignoreRingsSet bool
-	hostIfName     string
-	peerIfName     string
-	addCalls       int
-	deleteCalls    int
+	links            map[string]netlink.Link
+	leases           map[uint32]*netlink.NetDevQueueLease
+	addedNetkit      *netlink.Netkit
+	createErrors     map[uint32]error
+	createRequests   []netlink.NetDevQueueCreateRequest
+	realRXQueues     int
+	rss              netlink.NetDevRSS
+	rings            netlink.NetDevRings
+	rssSetCalls      []netlink.NetDevRSSConfig
+	ringsSetCalls    []netlink.NetDevRingsConfig
+	rssSetError      error
+	ringsSetError    error
+	ignoreRSSSet     bool
+	ignoreRingsSet   bool
+	hostIfName       string
+	peerIfName       string
+	addCalls         int
+	deleteCalls      int
+	flows            map[uint32]netlink.NetDevRxFlow
+	flowInsertCalls  []netlink.NetDevRxFlow
+	flowDeleteCalls  []uint32
+	flowInsertErrors map[int]error
+	nextFlowLocation uint32
 }
 
 func newFakeNetlink(maxRXQueues, realRXQueues int, shareID kube_types.UID) *fakeNetlink {
@@ -82,9 +87,12 @@ func newFakeNetlink(maxRXQueues, realRXQueues int, shareID kube_types.UID) *fake
 		links: map[string]netlink.Link{
 			testPhysicalIfName: physical,
 		},
-		leases:       make(map[uint32]*netlink.NetDevQueueLease),
-		createErrors: make(map[uint32]error),
-		realRXQueues: realRXQueues,
+		leases:           make(map[uint32]*netlink.NetDevQueueLease),
+		createErrors:     make(map[uint32]error),
+		flows:            make(map[uint32]netlink.NetDevRxFlow),
+		flowInsertErrors: make(map[int]error),
+		nextFlowLocation: 100,
+		realRXQueues:     realRXQueues,
 		rss: netlink.NetDevRSS{
 			HashFunction:        netlink.NetDevRSSHashFunctionToeplitz,
 			IndirectionTable:    indirectionTable,
@@ -118,6 +126,9 @@ func (f *fakeNetlink) install(t *testing.T) {
 	originalRSSSet := netlinkNetDevRSSSet
 	originalRingsGet := netlinkNetDevRingsGet
 	originalRingsSet := netlinkNetDevRingsSet
+	originalFlowInsert := netlinkNetDevRxFlowInsert
+	originalFlowDelete := netlinkNetDevRxFlowDelete
+	originalFlowList := netlinkNetDevRxFlowList
 	t.Cleanup(func() {
 		netlinkLinkByName = originalLinkByName
 		netlinkLinkAdd = originalLinkAdd
@@ -130,6 +141,9 @@ func (f *fakeNetlink) install(t *testing.T) {
 		netlinkNetDevRSSSet = originalRSSSet
 		netlinkNetDevRingsGet = originalRingsGet
 		netlinkNetDevRingsSet = originalRingsSet
+		netlinkNetDevRxFlowInsert = originalFlowInsert
+		netlinkNetDevRxFlowDelete = originalFlowDelete
+		netlinkNetDevRxFlowList = originalFlowList
 	})
 
 	netlinkLinkByName = func(name string) (netlink.Link, error) {
@@ -259,6 +273,42 @@ func (f *fakeNetlink) install(t *testing.T) {
 			f.rings.TCPDataSplit = *config.TCPDataSplit
 		}
 		return nil
+	}
+	netlinkNetDevRxFlowInsert = func(ifName string, flow netlink.NetDevRxFlow) (uint32, error) {
+		if ifName != testPhysicalIfName {
+			return 0, unix.ENODEV
+		}
+		f.flowInsertCalls = append(f.flowInsertCalls, flow)
+		if err := f.flowInsertErrors[len(f.flowInsertCalls)]; err != nil {
+			return 0, err
+		}
+		location := flow.Location
+		if location == netlink.RX_CLS_LOC_ANY {
+			location = f.nextFlowLocation
+			f.nextFlowLocation++
+		}
+		flow.Location = location
+		f.flows[location] = flow
+		return location, nil
+	}
+	netlinkNetDevRxFlowDelete = func(ifName string, location uint32) error {
+		if ifName != testPhysicalIfName {
+			return unix.ENODEV
+		}
+		f.flowDeleteCalls = append(f.flowDeleteCalls, location)
+		delete(f.flows, location)
+		return nil
+	}
+	netlinkNetDevRxFlowList = func(ifName string) ([]uint32, error) {
+		if ifName != testPhysicalIfName {
+			return nil, unix.ENODEV
+		}
+		locations := make([]uint32, 0, len(f.flows))
+		for location := range f.flows {
+			locations = append(locations, location)
+		}
+		slices.Sort(locations)
+		return locations, nil
 	}
 }
 

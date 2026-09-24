@@ -31,6 +31,7 @@ const (
 	mainRSSContext          = 0
 	netkitPeerRXQueues      = 2
 	netkitTxQLen            = 1000
+	hardwareGROFeature      = "rx-gro-hw"
 
 	hostIfNamePrefix = "zrxh"
 	peerIfNamePrefix = "zrxp"
@@ -56,6 +57,8 @@ var (
 	netlinkNetDevRSSSet       = netlink.NetDevRSSSet
 	netlinkNetDevRingsGet     = netlink.NetDevRingsGet
 	netlinkNetDevRingsSet     = netlink.NetDevRingsSet
+	netlinkNetDevFeaturesGet  = netlink.NetDevFeaturesGet
+	netlinkNetDevFeaturesSet  = netlink.NetDevFeaturesSet
 	netlinkNetDevRxFlowInsert = netlink.NetDevRxFlowInsert
 	netlinkNetDevRxFlowDelete = netlink.NetDevRxFlowDelete
 	netlinkNetDevRxFlowList   = netlink.NetDevRxFlowList
@@ -95,6 +98,7 @@ func NewManager(logger *slog.Logger, cfg *v2alpha1.RXQueueDeviceManagerConfig) (
 			"reservedRXQueues", dev.ReservedQueueIDs,
 			"rssUpdated", state.rssChanged,
 			"tcpDataSplitUpdated", state.ringsChanged,
+			"hardwareGROUpdated", state.hardwareGROChanged,
 		)
 	}
 
@@ -102,12 +106,14 @@ func NewManager(logger *slog.Logger, cfg *v2alpha1.RXQueueDeviceManagerConfig) (
 }
 
 type rxQueueNICState struct {
-	ifName        string
-	ifIndex       int
-	originalRSS   *netlink.NetDevRSS
-	originalRings netlink.NetDevRings
-	rssChanged    bool
-	ringsChanged  bool
+	ifName              string
+	ifIndex             int
+	originalRSS         *netlink.NetDevRSS
+	originalRings       netlink.NetDevRings
+	originalHardwareGRO netlink.NetDevFeature
+	rssChanged          bool
+	ringsChanged        bool
+	hardwareGROChanged  bool
 }
 
 func prepareRXQueueNIC(dev *RXQueueDevice) (_ *rxQueueNICState, retErr error) {
@@ -135,15 +141,27 @@ func prepareRXQueueNIC(dev *RXQueueDevice) (_ *rxQueueNICState, retErr error) {
 	if rings == nil {
 		return nil, fmt.Errorf("failed to read ring configuration on %s: empty response", dev.PhysicalIfName)
 	}
-	if rings.TCPDataSplit == netlink.NetDevTCPDataSplitUnknown {
-		return nil, fmt.Errorf("TCP data splitting is not supported on %s: %w", dev.PhysicalIfName, unix.EOPNOTSUPP)
+
+	var hardwareGRO netlink.NetDevFeature
+	requiresHardwareGRO := rings.TCPDataSplit == netlink.NetDevTCPDataSplitUnknown
+	if requiresHardwareGRO {
+		features, err := netlinkNetDevFeaturesGet(link.Attrs().Index)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read features on %s: %w", dev.PhysicalIfName, err)
+		}
+		var ok bool
+		hardwareGRO, ok = features[hardwareGROFeature]
+		if !ok || !hardwareGRO.Hardware || (!hardwareGRO.Active && (hardwareGRO.NoChange || hardwareGRO.Wanted)) {
+			return nil, fmt.Errorf("TCP data splitting is not supported on %s: %w", dev.PhysicalIfName, unix.EOPNOTSUPP)
+		}
 	}
 
 	state := &rxQueueNICState{
-		ifName:        dev.PhysicalIfName,
-		ifIndex:       link.Attrs().Index,
-		originalRSS:   cloneNetDevRSS(rss),
-		originalRings: *rings,
+		ifName:              dev.PhysicalIfName,
+		ifIndex:             link.Attrs().Index,
+		originalRSS:         cloneNetDevRSS(rss),
+		originalRings:       *rings,
+		originalHardwareGRO: hardwareGRO,
 	}
 	defer func() {
 		if retErr == nil {
@@ -164,16 +182,28 @@ func prepareRXQueueNIC(dev *RXQueueDevice) (_ *rxQueueNICState, retErr error) {
 	}
 
 	expectedRings := *rings
+	if requiresHardwareGRO {
+		if !hardwareGRO.Active {
+			if err := netlinkNetDevFeaturesSet(state.ifIndex, map[string]bool{hardwareGROFeature: true}); err != nil {
+				return nil, fmt.Errorf("failed to enable hardware GRO on %s: %w", state.ifName, err)
+			}
+			state.hardwareGROChanged = true
+		}
+	}
+
 	expectedRings.TCPDataSplit = netlink.NetDevTCPDataSplitEnabled
-	if rings.TCPDataSplit != netlink.NetDevTCPDataSplitEnabled {
-		enabled := netlink.NetDevTCPDataSplitEnabled
-		if err := netlinkNetDevRingsSet(state.ifIndex, netlink.NetDevRingsConfig{TCPDataSplit: &enabled}); err != nil {
+	expectedRings.HDSThreshold = 0
+	if rings.TCPDataSplit != expectedRings.TCPDataSplit || rings.HDSThreshold != expectedRings.HDSThreshold {
+		if err := netlinkNetDevRingsSet(state.ifIndex, netlink.NetDevRingsConfig{
+			TCPDataSplit: &expectedRings.TCPDataSplit,
+			HDSThreshold: &expectedRings.HDSThreshold,
+		}); err != nil {
 			return nil, fmt.Errorf("failed to enable TCP data splitting on %s: %w", state.ifName, err)
 		}
 		state.ringsChanged = true
 	}
 
-	if err := verifyRXQueueNIC(state.ifName, state.ifIndex, expectedRSS, &expectedRings); err != nil {
+	if err := verifyRXQueueNIC(state.ifName, state.ifIndex, expectedRSS, &expectedRings, requiresHardwareGRO); err != nil {
 		return nil, err
 	}
 
@@ -268,7 +298,7 @@ func equalNetDevRSS(a, b *netlink.NetDevRSS) bool {
 		a.InputTransformation == b.InputTransformation
 }
 
-func verifyRXQueueNIC(ifName string, ifIndex int, wantRSS *netlink.NetDevRSS, wantRings *netlink.NetDevRings) error {
+func verifyRXQueueNIC(ifName string, ifIndex int, wantRSS *netlink.NetDevRSS, wantRings *netlink.NetDevRings, requiresHardwareGRO bool) error {
 	rss, err := netlinkNetDevRSSGet(ifIndex, mainRSSContext)
 	if err != nil {
 		return fmt.Errorf("failed to verify RSS configuration on %s: %w", ifName, err)
@@ -285,13 +315,27 @@ func verifyRXQueueNIC(ifName string, ifIndex int, wantRSS *netlink.NetDevRSS, wa
 		return fmt.Errorf("ring configuration read back incorrectly on %s", ifName)
 	}
 
+	if requiresHardwareGRO {
+		features, err := netlinkNetDevFeaturesGet(ifIndex)
+		if err != nil {
+			return fmt.Errorf("failed to verify hardware GRO on %s: %w", ifName, err)
+		}
+		feature, ok := features[hardwareGROFeature]
+		if !ok || !feature.Active {
+			return fmt.Errorf("hardware GRO read back incorrectly on %s", ifName)
+		}
+	}
+
 	return nil
 }
 
 func (s *rxQueueNICState) restore() error {
 	var errs []error
 	if s.ringsChanged {
-		if err := netlinkNetDevRingsSet(s.ifIndex, netlink.NetDevRingsConfig{TCPDataSplit: &s.originalRings.TCPDataSplit}); err != nil {
+		if err := netlinkNetDevRingsSet(s.ifIndex, netlink.NetDevRingsConfig{
+			TCPDataSplit: &s.originalRings.TCPDataSplit,
+			HDSThreshold: &s.originalRings.HDSThreshold,
+		}); err != nil {
 			errs = append(errs, fmt.Errorf("restore ring configuration: %w", err))
 		} else {
 			rings, err := netlinkNetDevRingsGet(s.ifIndex)
@@ -299,6 +343,18 @@ func (s *rxQueueNICState) restore() error {
 				errs = append(errs, fmt.Errorf("verify restored ring configuration: %w", err))
 			} else if rings == nil || *rings != s.originalRings {
 				errs = append(errs, errors.New("restored ring configuration did not match its original state"))
+			}
+		}
+	}
+	if s.hardwareGROChanged {
+		if err := netlinkNetDevFeaturesSet(s.ifIndex, map[string]bool{hardwareGROFeature: s.originalHardwareGRO.Wanted}); err != nil {
+			errs = append(errs, fmt.Errorf("restore hardware GRO: %w", err))
+		} else {
+			features, err := netlinkNetDevFeaturesGet(s.ifIndex)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("verify restored hardware GRO: %w", err))
+			} else if feature, ok := features[hardwareGROFeature]; !ok || feature != s.originalHardwareGRO {
+				errs = append(errs, errors.New("restored hardware GRO did not match its original state"))
 			}
 		}
 	}

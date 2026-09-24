@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/cilium/cilium/pkg/networkdriver/types"
@@ -338,7 +339,7 @@ func ensureRXFlow(
 	if err != nil {
 		return 0, err
 	}
-	location, err := netlinkNetDevRxFlowInsert(ifName, netlink.NetDevRxFlow{
+	location, err := insertRXFlow(ifName, netlink.NetDevRxFlow{
 		Match:    match,
 		Queue:    queueID,
 		Location: requestedLocation,
@@ -372,6 +373,48 @@ func ensureRXFlow(
 
 	cleanup = false
 	return location, nil
+}
+
+func insertRXFlow(ifName string, flow netlink.NetDevRxFlow) (uint32, error) {
+	location, err := netlinkNetDevRxFlowInsert(ifName, flow)
+	if err == nil {
+		return location, nil
+	}
+
+	// The ethtool UAPI makes driver-assigned locations optional.
+	if !errors.Is(err, unix.EINVAL) && !errors.Is(err, unix.ENOSPC) {
+		return 0, err
+	}
+
+	locations, listErr := netlinkNetDevRxFlowList(ifName)
+	if listErr != nil {
+		return 0, errors.Join(
+			fmt.Errorf("driver-assigned RX flow location failed: %w", err),
+			fmt.Errorf("failed to list RX flow rules: %w", listErr),
+		)
+	}
+
+	flow.Location = firstAvailableRXFlowLocation(locations)
+	location, explicitErr := netlinkNetDevRxFlowInsert(ifName, flow)
+	if explicitErr != nil {
+		return 0, errors.Join(
+			fmt.Errorf("driver-assigned RX flow location failed: %w", err),
+			fmt.Errorf("explicit RX flow location %d failed: %w", flow.Location, explicitErr),
+		)
+	}
+	return location, nil
+}
+
+func firstAvailableRXFlowLocation(locations []uint32) uint32 {
+	used := make(map[uint32]struct{}, len(locations))
+	for _, location := range locations {
+		used[location] = struct{}{}
+	}
+	for location := uint32(0); ; location++ {
+		if _, exists := used[location]; !exists {
+			return location
+		}
+	}
 }
 
 func deleteRXFlows(ifName string, locations []uint32) error {

@@ -28,6 +28,7 @@ import (
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/utils/ptr"
 
+	"github.com/cilium/cilium/pkg/datapath/connector"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/k8s/version"
@@ -57,6 +58,7 @@ type Driver struct {
 	jg             job.Group
 	resourceClaims resource.Resource[*resourceapi.ResourceClaim]
 	pods           resource.Resource[*corev1.Pod]
+	datapathMode   connector.Mode
 
 	configCRD resource.Resource[*v2alpha1.CiliumNetworkDriverNodeConfig]
 	config    *v2alpha1.CiliumNetworkDriverNodeConfigSpec
@@ -197,6 +199,10 @@ func (driver *Driver) Start(ctx cell.HookContext) error {
 				logfields.Error, err,
 			)
 
+			return err
+		}
+
+		if err := validateRXQueueDatapath(driver.config.DeviceManagerConfigs, driver.datapathMode); err != nil {
 			return err
 		}
 
@@ -372,6 +378,22 @@ func (driver *Driver) validateConsumableCapacityVersion(k8sVersion semver.Versio
 		}
 	}
 
+	return nil
+}
+
+func validateRXQueueDatapath(
+	configs *v2alpha1.CiliumNetworkDriverDeviceManagerConfig,
+	mode connector.Mode,
+) error {
+	if configs == nil || configs.RXQueue == nil || !configs.RXQueue.Enabled {
+		return nil
+	}
+	if !mode.IsNetkit() {
+		return fmt.Errorf(
+			"RX queue device manager requires the netkit or netkit-l2 datapath, got %q",
+			mode,
+		)
+	}
 	return nil
 }
 

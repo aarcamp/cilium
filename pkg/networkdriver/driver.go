@@ -28,6 +28,7 @@ import (
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/utils/ptr"
 
+	"github.com/cilium/cilium/pkg/datapath/connector"
 	"github.com/cilium/cilium/pkg/datapath/xdp"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -58,6 +59,7 @@ type Driver struct {
 	jg             job.Group
 	resourceClaims resource.Resource[*resourceapi.ResourceClaim]
 	pods           resource.Resource[*corev1.Pod]
+	datapathMode   connector.Mode
 	xdpMode        xdp.AccelerationMode
 
 	configCRD resource.Resource[*v2alpha1.CiliumNetworkDriverNodeConfig]
@@ -202,7 +204,7 @@ func (driver *Driver) Start(ctx cell.HookContext) error {
 			return err
 		}
 
-		if err := validateRXQueueDatapath(driver.config.DeviceManagerConfigs, driver.xdpMode); err != nil {
+		if err := validateRXQueueDatapath(driver.config.DeviceManagerConfigs, driver.datapathMode, driver.xdpMode); err != nil {
 			return err
 		}
 
@@ -381,14 +383,21 @@ func (driver *Driver) validateConsumableCapacityVersion(k8sVersion semver.Versio
 	return nil
 }
 
-// validateRXQueueDatapath rejects datapath features that cannot coexist
-// with the NIC configuration RX queue leasing requires.
+// validateRXQueueDatapath rejects datapath settings that cannot coexist
+// with RX queue leasing.
 func validateRXQueueDatapath(
 	configs *v2alpha1.CiliumNetworkDriverDeviceManagerConfig,
+	mode connector.Mode,
 	xdpMode xdp.AccelerationMode,
 ) error {
 	if configs == nil || configs.RXQueue == nil || !configs.RXQueue.Enabled {
 		return nil
+	}
+	if !mode.IsNetkit() {
+		return fmt.Errorf(
+			"RX queue device manager requires the netkit or netkit-l2 datapath, got %q",
+			mode,
+		)
 	}
 	// The kernel refuses XDP programs without multi-buffer support on a
 	// device using TCP header/data splitting, and refuses every XDP program

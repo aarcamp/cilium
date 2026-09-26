@@ -38,6 +38,7 @@ import (
 	kubetypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
+	"github.com/cilium/cilium/pkg/datapath/connector"
 	"github.com/cilium/cilium/pkg/datapath/xdp"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
@@ -103,10 +104,14 @@ func TestValidateRXQueueDatapath(t *testing.T) {
 		RXQueue: &v2alpha1.RXQueueDeviceManagerConfig{Enabled: true},
 	}
 
-	require.NoError(t, validateRXQueueDatapath(nil, xdp.AccelerationModeNative))
-	require.NoError(t, validateRXQueueDatapath(disabled, xdp.AccelerationModeNative))
-	require.NoError(t, validateRXQueueDatapath(enabled, xdp.AccelerationModeDisabled))
-	require.ErrorContains(t, validateRXQueueDatapath(enabled, xdp.AccelerationModeBestEffort),
+	require.NoError(t, validateRXQueueDatapath(nil, connector.ModeVeth, xdp.AccelerationModeNative))
+	require.NoError(t, validateRXQueueDatapath(disabled, connector.ModeVeth, xdp.AccelerationModeNative))
+	for _, mode := range []connector.Mode{connector.ModeNetkit, connector.ModeNetkitL2} {
+		require.NoError(t, validateRXQueueDatapath(enabled, mode, xdp.AccelerationModeDisabled))
+	}
+	require.ErrorContains(t, validateRXQueueDatapath(enabled, connector.ModeVeth, xdp.AccelerationModeDisabled),
+		"requires the netkit or netkit-l2 datapath")
+	require.ErrorContains(t, validateRXQueueDatapath(enabled, connector.ModeNetkit, xdp.AccelerationModeBestEffort),
 		"incompatible with XDP acceleration")
 }
 

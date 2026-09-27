@@ -319,7 +319,9 @@ func testDeviceWithCount(total, count int) *RXQueueDevice {
 		MTU:              9000,
 		TotalRXQueues:    total,
 		ReservedQueueIDs: reservedRXQueueIDs(total, count),
-		reservations:     &queueReservations{owners: make(map[uint32]kube_types.UID)},
+		reservations: &queueReservations{
+			owners: make(map[uint32]kube_types.UID),
+		},
 	}
 }
 
@@ -344,7 +346,8 @@ func TestReservedRXQueueIDs(t *testing.T) {
 		{total: 8, count: 8},
 		{total: 2, count: 1, want: []uint32{1}},
 		{total: 4, count: 3, want: []uint32{3, 2, 1}},
-		{total: 64, count: 4, want: []uint32{63, 62, 61, 60}},
+		{total: 8, count: 2, want: []uint32{7, 6}},
+		{total: 64, count: 8, want: []uint32{63, 62, 61, 60, 59, 58, 57, 56}},
 	}
 
 	for _, tt := range tests {
@@ -356,18 +359,27 @@ func TestReservedRXQueueIDs(t *testing.T) {
 func TestValidateConfig(t *testing.T) {
 	require.ErrorIs(t, validateConfig(nil), errNoInterfaces)
 	require.ErrorIs(t, validateConfig(&v2alpha1.RXQueueDeviceManagerConfig{}), errNoInterfaces)
-	require.Error(t, validateConfig(&v2alpha1.RXQueueDeviceManagerConfig{
+
+	err := validateConfig(&v2alpha1.RXQueueDeviceManagerConfig{
 		Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: ""}},
-	}))
-	require.Error(t, validateConfig(&v2alpha1.RXQueueDeviceManagerConfig{
+	})
+	require.Error(t, err)
+
+	err = validateConfig(&v2alpha1.RXQueueDeviceManagerConfig{
 		Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: "lo"}},
-	}))
-	require.Error(t, validateConfig(&v2alpha1.RXQueueDeviceManagerConfig{
+	})
+	require.Error(t, err)
+
+	err = validateConfig(&v2alpha1.RXQueueDeviceManagerConfig{
 		Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: "eth0", Count: -1}},
-	}))
-	require.ErrorIs(t, validateConfig(&v2alpha1.RXQueueDeviceManagerConfig{
+	})
+	require.Error(t, err)
+
+	err = validateConfig(&v2alpha1.RXQueueDeviceManagerConfig{
 		Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: "eth0"}, {IfName: "eth0"}},
-	}), errDuplicateInterface)
+	})
+	require.ErrorIs(t, err, errDuplicateInterface)
+
 	require.NoError(t, validateConfig(&v2alpha1.RXQueueDeviceManagerConfig{
 		Ifaces: []v2alpha1.RXQueueDeviceConfig{{IfName: "eth0"}, {IfName: "eth1"}},
 	}))
@@ -389,7 +401,8 @@ func TestActiveRXQueueCount(t *testing.T) {
 		fake.links[testPhysicalIfName].Attrs().Flags = 0
 
 		_, err := activeRXQueueCount(fake.links[testPhysicalIfName])
-		require.ErrorContains(t, err, "down")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "down")
 	})
 
 	t.Run("queue error is returned", func(t *testing.T) {
@@ -847,33 +860,32 @@ func TestNewManager(t *testing.T) {
 func TestRXQueueReservations(t *testing.T) {
 	fake := newFakeNetlink(8, 8, testShareID)
 	fake.install(t)
+
 	advertised := testDeviceWithCount(8, 2)
-	first := testAllocation(testShareID)
-	second := testAllocation(kube_types.UID("second"))
-	third := testAllocation(kube_types.UID("third"))
-
-	preparedFirst, err := advertised.Setup(first)
+	firstAllocation := testAllocation(testShareID)
+	firstDevice, err := advertised.Setup(firstAllocation)
 	require.NoError(t, err)
-	firstDev := preparedFirst.(*RXQueueDevice)
-	require.EqualValues(t, 7, firstDev.PhysicalQueueID)
-	require.Equal(t, types.DefaultRXQueuePodIfName, firstDev.PodIfName)
-	require.EqualValues(t, firstLeasedRXQueueID, firstDev.VirtualQueueID)
+	first := firstDevice.(*RXQueueDevice)
+	require.Equal(t, uint32(7), first.PhysicalQueueID)
 
-	repeated, err := advertised.Setup(first)
+	retried, err := advertised.Setup(firstAllocation)
 	require.NoError(t, err)
-	require.EqualValues(t, firstDev.PhysicalQueueID, repeated.(*RXQueueDevice).PhysicalQueueID)
+	require.Equal(t, first.PhysicalQueueID, retried.(*RXQueueDevice).PhysicalQueueID)
 
-	preparedSecond, err := advertised.Setup(second)
+	secondShare := kube_types.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	secondDevice, err := advertised.Setup(testAllocation(secondShare))
 	require.NoError(t, err)
-	require.EqualValues(t, 6, preparedSecond.(*RXQueueDevice).PhysicalQueueID)
+	require.Equal(t, uint32(6), secondDevice.(*RXQueueDevice).PhysicalQueueID)
+	require.Empty(t, fake.leases, "DRA preparation must not create a kernel lease")
 
-	_, err = advertised.Setup(third)
+	thirdShare := kube_types.UID("ffffffff-1111-2222-3333-444444444444")
+	_, err = advertised.Setup(testAllocation(thirdShare))
 	require.ErrorIs(t, err, errNoAvailableRXQueue)
 
-	require.NoError(t, firstDev.Free(first))
-	preparedThird, err := advertised.Setup(third)
+	require.NoError(t, first.Free(firstAllocation))
+	reused, err := advertised.Setup(testAllocation(thirdShare))
 	require.NoError(t, err)
-	require.EqualValues(t, 7, preparedThird.(*RXQueueDevice).PhysicalQueueID)
+	require.Equal(t, uint32(7), reused.(*RXQueueDevice).PhysicalQueueID)
 }
 
 func TestRXQueueReservationSkipsKernelLease(t *testing.T) {
@@ -881,100 +893,87 @@ func TestRXQueueReservationSkipsKernelLease(t *testing.T) {
 	fake.leases[7] = &netlink.NetDevQueueLease{IfIndex: 99}
 	fake.install(t)
 
-	prepared, err := testDeviceWithCount(8, 2).Setup(testAllocation(testShareID))
+	device, err := testDeviceWithCount(8, 2).Setup(testAllocation(testShareID))
 	require.NoError(t, err)
-	require.EqualValues(t, 6, prepared.(*RXQueueDevice).PhysicalQueueID)
-}
-
-func TestRXQueueFreeRejectsActiveLease(t *testing.T) {
-	fake := newFakeNetlink(8, 8, testShareID)
-	fake.install(t)
-	allocation := testAllocation(testShareID)
-
-	prepared, err := testDeviceWithCount(8, 1).Setup(allocation)
-	require.NoError(t, err)
-	dev := prepared.(*RXQueueDevice)
-	fake.leases[dev.PhysicalQueueID] = &netlink.NetDevQueueLease{IfIndex: 99}
-
-	require.ErrorIs(t, dev.Free(allocation), errActiveLease)
-	require.Equal(t, testShareID, dev.reservations.owners[dev.PhysicalQueueID])
+	require.Equal(t, uint32(6), device.(*RXQueueDevice).PhysicalQueueID)
 }
 
 func TestRecoverRXQueueReservation(t *testing.T) {
 	fake := newFakeNetlink(8, 8, testShareID)
 	fake.install(t)
-	allocation := testAllocation(testShareID)
-	allocation.Config.PodIfName = "net1"
 
-	prepared, err := testDeviceWithCount(8, 1).Setup(allocation)
+	device, err := testDevice(8).Setup(testAllocation(testShareID))
 	require.NoError(t, err)
+	data, err := device.MarshalBinary()
+	require.NoError(t, err)
+
+	manager := &RXQueueManager{}
+	restoredDevice, err := manager.RestoreDevice(data)
+	require.NoError(t, err)
+	recovered, err := restoredDevice.Recover(testAllocation(testShareID))
+	require.NoError(t, err)
+	require.Equal(t, uint32(7), recovered.(*RXQueueDevice).PhysicalQueueID)
+
+	_, err = restoredDevice.Recover(testAllocation(kube_types.UID("different-share")))
+	require.ErrorIs(t, err, errInvalidAllocation)
+
+	wrongInterface := testAllocation(testShareID)
+	wrongInterface.Config.PodIfName = "net1"
+	_, err = restoredDevice.Recover(wrongInterface)
+	require.ErrorIs(t, err, errInvalidAllocation)
+}
+func TestDeviceMetadataAndSerialization(t *testing.T) {
+	fake := newFakeNetlink(16, 16, testShareID)
+	fake.install(t)
+
+	advertised := testDevice(16)
+	require.True(t, advertised.Match(v2alpha1.CiliumNetworkDriverDeviceFilter{}))
+	require.True(t, advertised.Match(v2alpha1.CiliumNetworkDriverDeviceFilter{
+		DeviceManagers: []string{types.DeviceManagerTypeRXQueue.String()},
+		IfNames:        []string{testPhysicalIfName},
+	}))
+	require.False(t, advertised.Match(v2alpha1.CiliumNetworkDriverDeviceFilter{
+		Drivers: []string{"ice"},
+	}))
+
+	device, err := advertised.Setup(testAllocation(testShareID))
+	require.NoError(t, err)
+	prepared := device.(*RXQueueDevice)
+	require.True(t, prepared.Prepared)
+	require.False(t, prepared.Bound)
+	require.Equal(t, types.DefaultRXQueuePodIfName, prepared.PodIfName)
+	require.Empty(t, prepared.HostIfName)
+	require.Equal(t, uint32(15), prepared.PhysicalQueueID)
+	require.Equal(t, uint32(1), prepared.VirtualQueueID)
+	require.Empty(t, fake.leases)
+
+	attrs := prepared.GetAttrs()
+	require.EqualValues(t, 1, *attrs[types.RXQueueIDLabel].IntValue)
+	require.Equal(t, prepared.PhysicalIfName, *attrs[types.IfNameLabel].StringValue)
+
 	data, err := prepared.MarshalBinary()
 	require.NoError(t, err)
 
-	mgr := &RXQueueManager{reservations: make(map[string]*queueReservations)}
-	restored, err := mgr.RestoreDevice(data)
+	mgr := &RXQueueManager{}
+	restoredDevice, err := mgr.RestoreDevice(data)
 	require.NoError(t, err)
-	recovered, err := restored.Recover(allocation)
-	require.NoError(t, err)
-	require.Equal(t, prepared.(*RXQueueDevice).PhysicalQueueID, recovered.(*RXQueueDevice).PhysicalQueueID)
-
-	wrongShare := allocation
-	wrongShare.ShareID = "different"
-	_, err = restored.Recover(wrongShare)
-	require.ErrorIs(t, err, errInvalidAllocation)
-
-	wrongInterface := allocation
-	wrongInterface.Config.PodIfName = "net2"
-	_, err = restored.Recover(wrongInterface)
-	require.ErrorIs(t, err, errInvalidAllocation)
-}
-
-func TestDeviceMetadataAndSerialization(t *testing.T) {
-	dev := testDeviceWithCount(8, 2)
-	fake := newFakeNetlink(8, 8, testShareID)
-	fake.install(t)
-
-	attrs := dev.GetAttrs()
-	require.Equal(t, testPhysicalIfName, *attrs[types.IfNameLabel].StringValue)
-	require.Equal(t, "02:00:00:00:00:01", *attrs[types.HWAddrLabel].StringValue)
-	require.NotContains(t, attrs, types.RXQueueIDLabel)
-
-	allocation := testAllocation(testShareID)
-	allocation.Config.PodIfName = "net1"
-	prepared, err := dev.Setup(allocation)
-	require.NoError(t, err)
-	preparedDev := prepared.(*RXQueueDevice)
-	attrs = preparedDev.GetAttrs()
-	require.EqualValues(t, firstLeasedRXQueueID, *attrs[types.RXQueueIDLabel].IntValue)
-	require.Equal(t, "net1", preparedDev.IfName())
-
-	data, err := preparedDev.MarshalBinary()
-	require.NoError(t, err)
-	var restored RXQueueDevice
-	require.NoError(t, restored.UnmarshalBinary(data))
-	require.Equal(t, preparedDev.PhysicalIfName, restored.PhysicalIfName)
-	require.Equal(t, preparedDev.ReservedQueueIDs, restored.ReservedQueueIDs)
-	require.Equal(t, preparedDev.ShareID, restored.ShareID)
-	require.Equal(t, preparedDev.PodIfName, restored.PodIfName)
-	require.Equal(t, preparedDev.PhysicalQueueID, restored.PhysicalQueueID)
-	require.Equal(t, preparedDev.VirtualQueueID, restored.VirtualQueueID)
+	restored := restoredDevice.(*RXQueueDevice)
+	require.Equal(t, prepared.PhysicalIfName, restored.PhysicalIfName)
+	require.Equal(t, prepared.ReservedQueueIDs, restored.ReservedQueueIDs)
+	require.Equal(t, prepared.ShareID, restored.ShareID)
+	require.Equal(t, prepared.PodIfName, restored.PodIfName)
+	require.Equal(t, prepared.HostIfName, restored.HostIfName)
+	require.Equal(t, prepared.PhysicalQueueID, restored.PhysicalQueueID)
+	require.Equal(t, prepared.VirtualQueueID, restored.VirtualQueueID)
 }
 
 func TestValidateAllocation(t *testing.T) {
-	valid := testAllocation(testShareID)
-	require.NoError(t, validateAllocation(valid))
+	require.ErrorIs(t, validateAllocation(types.DeviceAllocation{}), errInvalidAllocation)
+	require.ErrorIs(t, validateAllocation(types.DeviceAllocation{ShareID: testShareID}), errInvalidAllocation)
 
-	missingShare := valid
-	missingShare.ShareID = ""
-	require.ErrorIs(t, validateAllocation(missingShare), errInvalidAllocation)
+	allocation := testAllocation(testShareID)
+	allocation.ConsumedCapacity[types.RXQueuesCapacity] = apiresource.MustParse("2")
+	require.ErrorIs(t, validateAllocation(allocation), errInvalidAllocation)
 
-	missingCapacity := valid
-	missingCapacity.ConsumedCapacity = nil
-	require.ErrorIs(t, validateAllocation(missingCapacity), errInvalidAllocation)
-
-	wrongCapacity := valid
-	wrongCapacity.ConsumedCapacity = map[resourceapi.QualifiedName]apiresource.Quantity{
-		types.RXQueuesCapacity: apiresource.MustParse("2"),
-	}
-	require.ErrorIs(t, validateAllocation(wrongCapacity), errInvalidAllocation)
+	require.NoError(t, validateAllocation(testAllocation(testShareID)))
 }

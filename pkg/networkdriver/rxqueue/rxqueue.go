@@ -437,12 +437,15 @@ type RXQueueDevice struct {
 	TotalRXQueues    int      `json:"totalRXQueues"`
 	ReservedQueueIDs []uint32 `json:"reservedQueueIDs"`
 
-	Prepared        bool           `json:"prepared,omitempty"`
-	ShareID         kube_types.UID `json:"shareID,omitempty"`
-	PodIfName       string         `json:"podIfName,omitempty"`
-	PhysicalQueueID uint32         `json:"physicalQueueID,omitempty"`
-	VirtualQueueID  uint32         `json:"virtualQueueID,omitempty"`
-	reservations    *queueReservations
+	Prepared          bool           `json:"prepared,omitempty"`
+	Bound             bool           `json:"bound,omitempty"`
+	ShareID           kube_types.UID `json:"shareID,omitempty"`
+	PodIfName         string         `json:"podIfName,omitempty"`
+	HostIfName        string         `json:"hostIfName,omitempty"`
+	OriginalHostAlias string         `json:"originalHostAlias,omitempty"`
+	PhysicalQueueID   uint32         `json:"physicalQueueID,omitempty"`
+	VirtualQueueID    uint32         `json:"virtualQueueID,omitempty"`
+	reservations      *queueReservations
 
 	mu sync.Mutex
 }
@@ -546,6 +549,14 @@ func netlinkNetDevQueueGetByName(ifName string, queueID uint32) (*netlink.NetDev
 	return queue, nil
 }
 
+func leaseMatches(lease *netlink.NetDevQueueLease, peerIfIndex int, peerNetNSID int32) bool {
+	return lease != nil &&
+		lease.IfIndex == uint32(peerIfIndex) &&
+		lease.Queue.Type == netlink.NetDevQueueTypeRx &&
+		lease.NetNSIDSet &&
+		lease.NetNSID == peerNetNSID
+}
+
 func (d *RXQueueDevice) Free(allocation types.DeviceAllocation) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -605,30 +616,36 @@ func (d *RXQueueDevice) KernelIfName() string {
 func (d *RXQueueDevice) Merge(_ types.Device) {}
 
 type deviceState struct {
-	PhysicalIfName   string         `json:"physicalIfName"`
-	HardwareAddress  string         `json:"hardwareAddress,omitempty"`
-	MTU              int            `json:"mtu,omitempty"`
-	TotalRXQueues    int            `json:"totalRXQueues"`
-	ReservedQueueIDs []uint32       `json:"reservedQueueIDs"`
-	Prepared         bool           `json:"prepared,omitempty"`
-	ShareID          kube_types.UID `json:"shareID,omitempty"`
-	PodIfName        string         `json:"podIfName,omitempty"`
-	PhysicalQueueID  uint32         `json:"physicalQueueID,omitempty"`
-	VirtualQueueID   uint32         `json:"virtualQueueID,omitempty"`
+	PhysicalIfName    string         `json:"physicalIfName"`
+	HardwareAddress   string         `json:"hardwareAddress,omitempty"`
+	MTU               int            `json:"mtu,omitempty"`
+	TotalRXQueues     int            `json:"totalRXQueues"`
+	ReservedQueueIDs  []uint32       `json:"reservedQueueIDs"`
+	Prepared          bool           `json:"prepared,omitempty"`
+	Bound             bool           `json:"bound,omitempty"`
+	ShareID           kube_types.UID `json:"shareID,omitempty"`
+	PodIfName         string         `json:"podIfName,omitempty"`
+	HostIfName        string         `json:"hostIfName,omitempty"`
+	OriginalHostAlias string         `json:"originalHostAlias,omitempty"`
+	PhysicalQueueID   uint32         `json:"physicalQueueID,omitempty"`
+	VirtualQueueID    uint32         `json:"virtualQueueID,omitempty"`
 }
 
 func (d *RXQueueDevice) MarshalBinary() ([]byte, error) {
 	return json.Marshal(deviceState{
-		PhysicalIfName:   d.PhysicalIfName,
-		HardwareAddress:  d.HardwareAddress,
-		MTU:              d.MTU,
-		TotalRXQueues:    d.TotalRXQueues,
-		ReservedQueueIDs: d.ReservedQueueIDs,
-		Prepared:         d.Prepared,
-		ShareID:          d.ShareID,
-		PodIfName:        d.PodIfName,
-		PhysicalQueueID:  d.PhysicalQueueID,
-		VirtualQueueID:   d.VirtualQueueID,
+		PhysicalIfName:    d.PhysicalIfName,
+		HardwareAddress:   d.HardwareAddress,
+		MTU:               d.MTU,
+		TotalRXQueues:     d.TotalRXQueues,
+		ReservedQueueIDs:  d.ReservedQueueIDs,
+		Prepared:          d.Prepared,
+		Bound:             d.Bound,
+		ShareID:           d.ShareID,
+		PodIfName:         d.PodIfName,
+		HostIfName:        d.HostIfName,
+		OriginalHostAlias: d.OriginalHostAlias,
+		PhysicalQueueID:   d.PhysicalQueueID,
+		VirtualQueueID:    d.VirtualQueueID,
 	})
 }
 
@@ -646,6 +663,9 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	if state.Prepared && (state.ShareID == "" || state.PodIfName == "") {
 		return errors.New("prepared RX queue device is missing its allocation identity")
 	}
+	if state.Bound && (!state.Prepared || state.HostIfName == "") {
+		return errors.New("bound RX queue device is missing its Pod netkit host name")
+	}
 
 	d.PhysicalIfName = state.PhysicalIfName
 	d.HardwareAddress = state.HardwareAddress
@@ -653,8 +673,11 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	d.TotalRXQueues = state.TotalRXQueues
 	d.ReservedQueueIDs = slices.Clone(state.ReservedQueueIDs)
 	d.Prepared = state.Prepared
+	d.Bound = state.Bound
 	d.ShareID = state.ShareID
 	d.PodIfName = state.PodIfName
+	d.HostIfName = state.HostIfName
+	d.OriginalHostAlias = state.OriginalHostAlias
 	d.PhysicalQueueID = state.PhysicalQueueID
 	d.VirtualQueueID = state.VirtualQueueID
 	return nil

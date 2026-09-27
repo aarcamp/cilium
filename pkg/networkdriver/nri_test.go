@@ -117,6 +117,38 @@ func TestRecoverAllocationDevice(t *testing.T) {
 // ---------------------------------------------------------------------------
 // StopPodSandbox — early exits (no netlink/netns)
 // ---------------------------------------------------------------------------
+func TestRXQueueAllocationUsesCNIInterface(t *testing.T) {
+	const podUID = kubetypes.UID("rx-queue-pod")
+	driver := buildNRIDriver(t)
+	driver.podNetns = make(map[kubetypes.UID]string)
+
+	device := &trackedDevice{name: types.DefaultRXQueuePodIfName}
+	wtxn := driver.db.WriteTxn(driver.allocationTable)
+	driver.allocationTable.Insert(wtxn, &DRAAllocation{
+		DeviceName:     "physical0",
+		Pool:           "rx-queues",
+		Manager:        types.DeviceManagerTypeRXQueue,
+		PreparedDevice: device,
+		PodUID:         podUID,
+		ClaimUID:       "rx-queue-claim",
+		Config: types.DeviceConfig{
+			PodIfName: types.DefaultRXQueuePodIfName,
+		},
+	})
+	wtxn.Commit()
+
+	require.NoError(t, driver.RunPodSandbox(
+		t.Context(),
+		podSandbox(string(podUID), "/run/netns/not-present"),
+	))
+	require.Equal(t, "/run/netns/not-present", driver.podNetns[podUID])
+
+	require.NoError(t, driver.StopPodSandbox(t.Context(), &api.PodSandbox{
+		Uid:   string(podUID),
+		Linux: &api.LinuxPodSandbox{},
+	}))
+	require.NotContains(t, driver.podNetns, podUID)
+}
 
 // TestStopPodSandbox_HostNetwork_Skipped verifies that a host-network pod is
 // silently skipped and the podNetns cache entry is evicted.

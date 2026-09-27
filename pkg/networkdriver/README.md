@@ -1,11 +1,13 @@
 # Cilium Network Driver
 
-Cilium Network Driver allows cilium-agent to expose network devices directly
-to pods, without those pods participating in the Cilium fabric. The driver
-registers as a
+Cilium Network Driver lets cilium-agent allocate network devices and hardware
+resources to pods through Kubernetes Dynamic Resource Allocation (DRA). The
+dummy and SR-IOV managers add separate interfaces to a pod. The RX queue
+manager instead leases a physical receive queue to the pod's existing
+Cilium-managed netkit interface. The driver registers as a
 [DRA](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)
 plugin and publishes `ResourceSlice` resources to the Kubernetes API so pods
-can claim devices via the standard DRA framework.
+can claim those resources through the standard DRA framework.
 
 ## Requirements
 
@@ -20,13 +22,13 @@ can claim devices via the standard DRA framework.
   when the Helm flag is enabled).
 - The RX queue manager additionally requires a Linux kernel with netdev RX
   queue leasing and netkit support (upstream Linux v7.1 or an equivalent
-  backport), and a NIC driver that implements RX queue leasing.
+  backport), a NIC driver that implements RX queue leasing, and Cilium's
+  operational datapath mode set to `netkit` or `netkit-l2`.
 
 ## Use cases
 
-Applications that need direct network device access on a separate network
-plane from the Cilium-managed pod network and/or physical device
-hand-off from the host, such as:
+Applications that need direct device access, physical device hand-off, or a
+dedicated receive queue on the Cilium-managed pod network, such as:
 
 - DPDK-based applications (VNFs, packet-processing pipelines)
 - High-frequency trading or other low-latency workloads
@@ -42,11 +44,11 @@ whenever the device set changes, then blocks until context cancellation.
 
 Available device managers:
 
-| Manager   | Key in CRD | `DeviceManagerType` string | Devices managed                                                  |
-|-----------|------------|----------------------------|------------------------------------------------------------------|
-| `sriov`   | `sriov`    | `sr-iov`                   | SR-IOV Virtual Functions (legacy mode)                           |
-| `dummy`   | `dummy`    | `dummy`                    | Linux dummy interfaces                                           |
-| `rxqueue` | `rxQueue`  | `rxQueue`                  | Physical NIC RX queue capacity                                   |
+| Manager   | Key in CRD | `DeviceManagerType` string | Devices managed                                                 |
+|-----------|------------|----------------------------|-----------------------------------------------------------------|
+| `sriov`   | `sriov`    | `sr-iov`                   | SR-IOV Virtual Functions (legacy mode)                          |
+| `dummy`   | `dummy`    | `dummy`                    | Linux dummy interfaces                                          |
+| `rxqueue` | `rxQueue`  | `rxQueue`                  | Physical RX queues leased to existing Pod netkit interfaces     |
 
 The dummy and SR-IOV managers publish exclusive devices. Each published dummy
 device or SR-IOV Virtual Function can be allocated to one claim at a time. The
@@ -125,21 +127,43 @@ manager selects the highest-numbered queues and always leaves at least one
 queue outside the reserved set. `count` defaults to one. Discovery runs once,
 so interface or queue-count changes require an agent restart.
 
-At `PrepareResourceClaims` time, the manager:
+At `PrepareResourceClaims` time, the manager selects an unleased physical
+queue from the reserved set and records that reservation for the scheduler's
+`ShareID`. It does not create a Pod interface or a kernel queue lease at this
+point. DRA preparation may finish before CNI creates the Pod's primary
+interface.
 
-1. Validates that the scheduler assigned one unit of `rxQueues` capacity and
-   supplied a `ShareID`.
-2. Selects an unleased physical queue from the reserved set.
-3. Records the queue reservation against that share and returns the
-   allocation-specific state.
+When the Network Driver is enabled, Cilium CNI creates each primary netkit
+peer with two RX queue slots. Queue 0 carries the regular Cilium datapath;
+queue 1 is available for a physical queue lease. Once CNI has created the
+endpoint and NRI has supplied the Pod network namespace, the RX queue
+reconciler:
 
-Repeated preparation of the same share returns the same queue. Different
-shares cannot reserve the same queue. Cleanup releases the in-memory
-reservation only after the kernel reports that no active lease remains.
+1. Matches the allocation to the Pod endpoint named by `podIfName` (`eth0` by
+   default).
+2. Opens the Pod network namespace and verifies the host and Pod links are the
+   two sides of a primary netkit pair.
+3. Uses netdev generic netlink to lease the reserved physical queue directly
+   to queue 1 on the Pod-side netkit.
+4. Reads the physical queue back and verifies the target interface, network
+   namespace, and virtual queue ID returned by the kernel.
+5. Resolves the claim's Pod or Service endpoint selector and installs the
+   corresponding hardware flow-steering rules on the physical NIC.
 
-After an agent restart, recovery restores the reservation for the physical
-queue recorded in `PreparedDevice`. It does not select a different reserved
-queue.
+NRI does not move, rename, or delete the netkit. CNI owns the interface and
+the existing Cilium netkit datapath continues to handle ordinary traffic.
+Only one RX queue allocation may target a given Pod interface.
+
+Reservation and binding are both safe to retry. The manager adopts the exact
+lease recorded for the allocation and rejects a queue leased to another
+interface or network namespace. Cleanup waits for CNI to remove the primary
+netkit and release the kernel lease, then removes flow-steering state and
+returns the physical queue to the manager's reserved pool.
+
+After an agent restart, the manager restores the physical queue reservation
+from `ResourceClaim` status. NRI synchronization restores the Pod network
+namespace path, and endpoint reconciliation verifies or re-creates the same
+lease. Recovery does not select a different physical queue.
 
 ### SR-IOV device manager
 
@@ -206,7 +230,8 @@ does not remove prepared allocation state. For an exclusive device, `Merge`
 preserves state that discovery can no longer see, such as an SR-IOV Virtual
 Function interface name after the interface moved into a pod network
 namespace. RX queue inventory represents the shared physical interface, so
-its allocation-specific netkit devices remain solely in the allocation table.
+the selected physical queue, target Pod interface, and binding state remain
+solely in the allocation table.
 
 `ResourceSlice` attributes are computed from `Dev.GetAttrs()` on each
 publication. The driver also adds the `pool` and `deviceManager` attributes.
@@ -277,11 +302,15 @@ PrepareResourceClaims (kubelet → DRA plugin)
 
 RunPodSandbox (container runtime → NRI plugin)
   └─ finds allocations by PodUID
-       ├─ if a prepared link is missing, calls Device.Recover with
-       │  Config, ShareID, and ConsumedCapacity
-       │    └─ replaces PreparedDevice in StateDB; ResourceClaim
-       │       status remains unchanged
-       └─ configures their devices in the pod network namespace
+       ├─ configures separate SR-IOV and dummy devices in the Pod namespace
+       └─ for an RX queue, caches the namespace and triggers reconciliation
+
+RX queue reconciliation (after CNI endpoint creation)
+  ├─ finds the Cilium endpoint matching PodUID + podIfName
+  ├─ binds the reserved physical queue to queue 1 on the existing netkit peer
+  ├─ persists the bound device in ResourceClaim status and StateDB
+  ├─ resolves the Pod or Service endpoint selector
+  └─ programs matching physical-NIC flow-steering rules
 
 UnprepareResourceClaims (kubelet → DRA plugin)
   └─ finds allocations by ClaimUID
@@ -323,6 +352,9 @@ on-demand link, `RunPodSandbox` calls `Device.Recover` when the replacement
 sandbox starts. Recovery updates `PreparedDevice` in StateDB but not the
 `ResourceClaim` status, so the device manager must return the same logical
 allocation.
+
+RX queue recovery restores the reservation first, then rebinds it to the
+replacement CNI netkit through endpoint reconciliation.
 
 Changes to either table trigger a new `ResourceSlice` publication. If one
 shareable device has several allocation rows in the same pool, publication
@@ -406,7 +438,8 @@ A shareable device may have several rows with the same `DeviceName` and
 `Pool`. Distinct `ShareID` values key those rows; each row records its consumed
 capacity, claim UID, and prepared device.
 For an RX queue allocation, `PreparedDevice` records the physical and virtual
-queue IDs, the share ID, and the target Pod interface name.
+queue IDs, the target Pod interface, the host-side primary netkit name, and
+whether the kernel lease has been bound.
 
 ## How to use the Network Driver
 
@@ -567,10 +600,21 @@ An error is logged whenever a device matches more than one pool.
 Device-specific configuration is passed as opaque parameters in the
 `ResourceClaim` (see step 3). Supported fields (from `types/types.go`):
 
-| Field       | Type     | Description                                                                 |
-|-------------|----------|------------------------------------------------------------------------------|
-| `vlan`      | `int32`  | 802.1q VLAN ID to configure on the device (SR-IOV only)                      |
-| `podIfName` | `string` | Interface name inside the pod namespace (SR-IOV, dummy, and RX queue)        |
+| Field       | Type     | Description                                                                    |
+|-------------|----------|--------------------------------------------------------------------------------|
+| `vlan`      | `int32`  | 802.1q VLAN ID to configure on the device (SR-IOV only)                        |
+| `podIfName` | `string` | Target Pod interface. RX queues use the existing interface and default to `eth0` |
+| `rxQueue`   | `object` | Pod or Service endpoint whose traffic is steered to the allocated RX queue     |
+
+`rxQueue` requires exactly one endpoint selector:
+
+- `podEndpoint` selects a port on the Pod consuming the claim. Its `port` may
+  be a decimal number or a named container port; `protocol` is `TCP` or `UDP`.
+- `serviceEndpoint` selects a Service in the Pod's namespace. `serviceName`
+  names the Service, and `port` may be its port name or decimal Service port.
+
+The driver resolves both selectors to the consuming Pod's current IPv4 and
+IPv6 endpoint addresses before programming the NIC.
 
 ### Cluster-wide configuration (operator-driven)
 
@@ -720,8 +764,9 @@ spec:
           device.attributes["networkdriver.cilium.io"].pool == "rx-queue-pool"
 ```
 
-This template requests one queue for the Pod's primary `eth0` interface. The
-primary interface is the default, so the opaque parameters may be omitted:
+This template requests one queue for the Pod's existing `eth0` interface and
+steers TCP destination port 9000 for the Pod's IPv4 and IPv6 addresses to that
+queue:
 
 ```yaml
 apiVersion: resource.k8s.io/v1
@@ -740,6 +785,29 @@ spec:
             capacity:
               requests:
                 rxQueues: "1"
+      config:
+        - requests:
+            - rx-queue
+          opaque:
+            driver: networkdriver.cilium.io
+            parameters:
+              podIfName: eth0
+              rxQueue:
+                podEndpoint:
+                  port: "9000"
+                  protocol: TCP
+```
+
+To select a Service port instead, replace `podEndpoint` with
+`serviceEndpoint`:
+
+```yaml
+parameters:
+  podIfName: eth0
+  rxQueue:
+    serviceEndpoint:
+      serviceName: storage
+      port: rpc
 ```
 
 ### 4. Request a device from a pod
@@ -855,13 +923,15 @@ field definitions and lifecycle.
 ### Verify an RX queue allocation
 
 ```bash
-# Show the reserved physical queue and the virtual queue ID intended for the Pod
+# Show the physical and virtual queue IDs, target interface, and binding state
 kubectl -n kube-system exec <cilium-pod> -c cilium-agent -- \
   cilium-dbg statedb |
   jq '.["networkdriver-dra-allocations"][] |
       select(.Manager == "rxQueue") |
       {DeviceName, ShareID, ConsumedCapacity, PreparedDevice}'
 
+# Confirm that the existing Pod interface is a two-queue netkit peer
+kubectl exec rx-queue-app -- ip -details link show dev eth0
 
 # Inspect the allocation metadata mounted through CDI
 kubectl exec rx-queue-app -- \
@@ -871,7 +941,7 @@ rx-queue/rx-queue/networkdriver.cilium.io-metadata.json
 
 The metadata file is a concatenated JSON stream with one object per supported
 metadata API version. Look for `networkData.interfaceName` set to `eth0` and
-the `rxQueueID` device attribute.
+the `rxQueueID` device attribute set to `1`.
 
 ## Feature status
 

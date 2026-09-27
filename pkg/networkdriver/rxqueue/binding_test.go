@@ -150,6 +150,44 @@ func TestBindRXQueueToPodNetkit(t *testing.T) {
 	require.Equal(t, uint32(7), next.(*RXQueueDevice).PhysicalQueueID)
 }
 
+func TestBindRXQueueAfterPodNetkitRecreation(t *testing.T) {
+	fake := newFakeNetlink(8, 8, testShareID)
+	fake.install(t)
+	const originalAlias = "cilium-primary"
+	fake.links[fake.hostIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+		Name: fake.hostIfName, Index: testHostIndex, Alias: originalAlias,
+	}}
+	peer := &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+		Name: "eth0", Index: testPeerIndex, NumRxQueues: 2,
+	}}
+	handle := installQueueBindingFakes(t, fake, peer)
+
+	device, err := testDevice(8).Setup(testAllocation(testShareID))
+	require.NoError(t, err)
+	device, err = device.(*RXQueueDevice).BindRXQueue(fake.hostIfName, &ciliumnetns.NetNS{})
+	require.NoError(t, err)
+	device, err = device.(*RXQueueDevice).SetRXQueueFlows(testRXFlows()[:1])
+	require.NoError(t, err)
+	programmed := device.(*RXQueueDevice)
+	require.NotEmpty(t, programmed.rxFlows)
+	require.NotEmpty(t, fake.flows)
+
+	// Removing the Pod netkit releases its queue lease and loses the alias
+	// journal, while the physical ntuple rule remains until Cilium removes it.
+	delete(fake.leases, programmed.PhysicalQueueID)
+	fake.links[fake.hostIfName] = &netlink.Netkit{LinkAttrs: netlink.LinkAttrs{
+		Name: fake.hostIfName, Index: testHostIndex, Alias: originalAlias,
+	}}
+
+	device, err = programmed.BindRXQueue(fake.hostIfName, &ciliumnetns.NetNS{})
+	require.NoError(t, err)
+	rebound := device.(*RXQueueDevice)
+	require.True(t, rebound.Bound)
+	require.Empty(t, rebound.rxFlows)
+	require.Empty(t, fake.flows)
+	require.Equal(t, []uint32{100}, fake.flowDeleteCalls)
+	require.Len(t, handle.creates, 2)
+}
 func TestBindRXQueueValidatesPodNetkit(t *testing.T) {
 	t.Run("requires queue capacity", func(t *testing.T) {
 		fake := newFakeNetlink(8, 8, testShareID)

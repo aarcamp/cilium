@@ -94,6 +94,9 @@ func (driver *Driver) Synchronize(ctx context.Context, pods []*api.PodSandbox, _
 		driver.logger.DebugContext(ctx, "NRI Synchronize: cached pod network namespaces",
 			logfields.Count, n,
 		)
+		if n != 0 {
+			driver.triggerRXQueueReconciliation()
+		}
 		return nil
 	})
 
@@ -130,6 +133,9 @@ func (driver *Driver) RunPodSandbox(ctx context.Context, podSandbox *api.PodSand
 		if len(podAllocations) == 0 {
 			log.DebugContext(ctx, "no allocation found")
 			return nil
+		}
+		if hasRXQueueAllocation(podAllocations) {
+			driver.triggerRXQueueReconciliation()
 		}
 		if !hasNRIManagedInterface(podAllocations) {
 			return nil
@@ -405,6 +411,14 @@ func configureIfName(l netlink.Link, newIfName string) (netlink.Link, error) {
 func hasNRIManagedInterface(allocations []allocation) bool {
 	for _, allocation := range allocations {
 		if allocation.Manager != types.DeviceManagerTypeRXQueue {
+			return true
+		}
+	}
+	return false
+}
+func hasRXQueueAllocation(allocations []allocation) bool {
+	for _, allocation := range allocations {
+		if allocation.Manager == types.DeviceManagerTypeRXQueue {
 			return true
 		}
 	}

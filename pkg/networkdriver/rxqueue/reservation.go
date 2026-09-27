@@ -143,6 +143,7 @@ func (d *RXQueueDevice) clone() *RXQueueDevice {
 		HostIfName:        d.HostIfName,
 		OriginalHostAlias: d.OriginalHostAlias,
 		PhysicalQueueID:   d.PhysicalQueueID,
+		rxFlows:           slices.Clone(d.rxFlows),
 		VirtualQueueID:    d.VirtualQueueID,
 		reservations:      d.reservations,
 	}

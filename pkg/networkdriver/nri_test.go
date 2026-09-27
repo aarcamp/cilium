@@ -121,6 +121,7 @@ func TestRXQueueAllocationUsesCNIInterface(t *testing.T) {
 	const podUID = kubetypes.UID("rx-queue-pod")
 	driver := buildNRIDriver(t)
 	driver.podNetns = make(map[kubetypes.UID]string)
+	driver.rxQueueReconcile = make(chan struct{}, 1)
 
 	device := &trackedDevice{name: types.DefaultRXQueuePodIfName}
 	wtxn := driver.db.WriteTxn(driver.allocationTable)
@@ -143,6 +144,7 @@ func TestRXQueueAllocationUsesCNIInterface(t *testing.T) {
 	))
 	require.Equal(t, "/run/netns/not-present", driver.podNetns[podUID])
 
+	require.Len(t, driver.rxQueueReconcile, 1)
 	require.NoError(t, driver.StopPodSandbox(t.Context(), &api.PodSandbox{
 		Uid:   string(podUID),
 		Linux: &api.LinuxPodSandbox{},

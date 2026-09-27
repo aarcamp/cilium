@@ -161,5 +161,18 @@ func (d *RXQueueDevice) BindRXQueue(hostIfName string, podNS *ciliumnetns.NetNS)
 	if !d.Bound || d.HostIfName != hostIfName {
 		bound.OriginalHostAlias = host.Attrs().Alias
 	}
+	ownership, err := ownedRXFlows(host, string(d.ShareID), bound.OriginalHostAlias)
+	if err != nil {
+		return nil, err
+	}
+	if len(bound.rxFlows) != 0 && len(ownership.locations) == 0 {
+		// CNI recreated the primary netkit. Its alias journal disappeared with
+		// the old link, so remove the durably recorded rules before steering the
+		// replacement endpoint.
+		if err := deleteRXFlows(d.PhysicalIfName, ownershipFromFlowStates(bound.rxFlows).locations); err != nil {
+			return nil, fmt.Errorf("failed to remove RX flow rules for replaced Pod netkit: %w", err)
+		}
+		bound.rxFlows = nil
+	}
 	return bound, nil
 }

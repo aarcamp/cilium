@@ -193,9 +193,8 @@ type Device interface {
 	GetCapacity() map[resourceapi.QualifiedName]resourceapi.DeviceCapacity
 	AllowMultipleAllocations() bool
 	// Setup prepares one allocation and returns the device representing it.
-	// For a shared device, this may be an allocation-specific child, such as a
-	// netdev that leases one RX queue, rather than the device published in the
-	// ResourceSlice.
+	// For a shared device, this may contain allocation-specific state, such as
+	// one reserved queue from a NIC published in the ResourceSlice.
 	Setup(allocation DeviceAllocation) (Device, error)
 	// Recover re-creates missing kernel state for an allocation restored from
 	// ResourceClaim status. The returned device must represent the same logical
@@ -220,7 +219,7 @@ type DeviceManager interface {
 }
 
 type DeviceConfig struct {
-	PodIfName string         `json:"podIfName,omitempty"` // Custom interface name for the pod namespace
+	PodIfName string         `json:"podIfName,omitempty"` // Target interface name in the pod namespace
 	Vlan      int32          `json:"vlan,omitempty"`      // VLAN ID to assign to the device (0 = untagged / no change)
 	RXQueue   *RXQueueConfig `json:"rxQueue,omitempty"`
 }

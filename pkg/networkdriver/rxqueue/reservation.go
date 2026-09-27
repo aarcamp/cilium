@@ -119,8 +119,11 @@ func (d *RXQueueDevice) releaseReservation() {
 func (d *RXQueueDevice) preparedForAllocation(shareID kube_types.UID, podIfName string, physicalQueueID uint32) *RXQueueDevice {
 	prepared := d.clone()
 	prepared.Prepared = true
+	prepared.Bound = false
 	prepared.ShareID = shareID
 	prepared.PodIfName = podIfName
+	prepared.HostIfName = ""
+	prepared.OriginalHostAlias = ""
 	prepared.PhysicalQueueID = physicalQueueID
 	prepared.VirtualQueueID = firstLeasedRXQueueID
 	return prepared
@@ -128,16 +131,19 @@ func (d *RXQueueDevice) preparedForAllocation(shareID kube_types.UID, podIfName 
 
 func (d *RXQueueDevice) clone() *RXQueueDevice {
 	return &RXQueueDevice{
-		PhysicalIfName:   d.PhysicalIfName,
-		HardwareAddress:  d.HardwareAddress,
-		MTU:              d.MTU,
-		TotalRXQueues:    d.TotalRXQueues,
-		ReservedQueueIDs: slices.Clone(d.ReservedQueueIDs),
-		Prepared:         d.Prepared,
-		ShareID:          d.ShareID,
-		PodIfName:        d.PodIfName,
-		PhysicalQueueID:  d.PhysicalQueueID,
-		VirtualQueueID:   d.VirtualQueueID,
-		reservations:     d.reservations,
+		PhysicalIfName:    d.PhysicalIfName,
+		HardwareAddress:   d.HardwareAddress,
+		MTU:               d.MTU,
+		TotalRXQueues:     d.TotalRXQueues,
+		ReservedQueueIDs:  slices.Clone(d.ReservedQueueIDs),
+		Prepared:          d.Prepared,
+		Bound:             d.Bound,
+		ShareID:           d.ShareID,
+		PodIfName:         d.PodIfName,
+		HostIfName:        d.HostIfName,
+		OriginalHostAlias: d.OriginalHostAlias,
+		PhysicalQueueID:   d.PhysicalQueueID,
+		VirtualQueueID:    d.VirtualQueueID,
+		reservations:      d.reservations,
 	}
 }

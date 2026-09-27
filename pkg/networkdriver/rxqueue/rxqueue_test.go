@@ -25,6 +25,8 @@ import (
 const (
 	testPhysicalIfName = "eth0"
 	testPhysicalIndex  = 10
+	testHostIndex      = 20
+	testPeerIndex      = 21
 	testShareID        = kube_types.UID("11111111-2222-3333-4444-555555555555")
 )
 
@@ -52,6 +54,7 @@ type fakeNetlink struct {
 	ringsSetError  error
 	ignoreRSSSet   bool
 	ignoreRingsSet bool
+	hostIfName     string
 }
 
 func newFakeNetlink(maxRXQueues, realRXQueues int, _ ...kube_types.UID) *fakeNetlink {
@@ -88,6 +91,7 @@ func newFakeNetlink(maxRXQueues, realRXQueues int, _ ...kube_types.UID) *fakeNet
 			TCPDataSplit:    netlink.NetDevTCPDataSplitDisabled,
 			HDSThresholdMax: 4096,
 		},
+		hostIfName: "lxc123",
 	}
 }
 
@@ -175,6 +179,10 @@ func (f *fakeNetlink) install(t *testing.T) {
 		}
 		return nil
 	}
+}
+
+func testDevice(total int) *RXQueueDevice {
+	return testDeviceWithCount(total, defaultReservedRXQueues)
 }
 
 func testDeviceWithCount(total, count int) *RXQueueDevice {

@@ -125,9 +125,13 @@ func (driver *Driver) RunPodSandbox(ctx context.Context, podSandbox *api.PodSand
 		log = log.With(logfields.NetNamespace, networkNamespace)
 
 		// Collect all allocations for this pod from the statedb table.
+
 		podAllocations := driver.allocationsForPod(kube_types.UID(podSandbox.Uid))
 		if len(podAllocations) == 0 {
 			log.DebugContext(ctx, "no allocation found")
+			return nil
+		}
+		if !hasNRIManagedInterface(podAllocations) {
 			return nil
 		}
 
@@ -153,6 +157,10 @@ func (driver *Driver) RunPodSandbox(ctx context.Context, podSandbox *api.PodSand
 
 		for i := range podAllocations {
 			a := &podAllocations[i]
+			if a.Manager == types.DeviceManagerTypeRXQueue {
+				// The RX queue is bound to the existing interface created by CNI.
+				continue
+			}
 			l, err := safenetlink.LinkByName(a.Device.KernelIfName())
 			if err != nil {
 				// A node reboot removes the pod netns and any on-demand link moved
@@ -255,6 +263,9 @@ func (driver *Driver) StopPodSandbox(ctx context.Context, podSandbox *api.PodSan
 			log.DebugContext(ctx, "no allocation found")
 			return nil
 		}
+		if !hasNRIManagedInterface(podAllocations) {
+			return nil
+		}
 
 		nsPath := path.Join(podNetNSPath, path.Base(networkNamespace))
 
@@ -274,6 +285,10 @@ func (driver *Driver) StopPodSandbox(ctx context.Context, podSandbox *api.PodSan
 
 		if err := podNs.Do(func() error {
 			for _, a := range podAllocations {
+				if a.Manager == types.DeviceManagerTypeRXQueue {
+					// CNI owns the Pod netkit and tears it down with the sandbox.
+					continue
+				}
 				if a.Manager == types.DeviceManagerTypeDummy {
 					// dummy device is an on-demand virtual device: the
 					// netns delete that follows tears them down, so there is
@@ -387,6 +402,15 @@ func configureIfName(l netlink.Link, newIfName string) (netlink.Link, error) {
 	return l, nil
 }
 
+func hasNRIManagedInterface(allocations []allocation) bool {
+	for _, allocation := range allocations {
+		if allocation.Manager != types.DeviceManagerTypeRXQueue {
+			return true
+		}
+	}
+	return false
+}
+
 // validateInterfaceNames checks if a pod's set of allocated devices
 // contain valid interface names, that dont collide with interfaces in the pod namespace.
 func validateInterfaceNames(alloc []allocation) error {
@@ -402,6 +426,9 @@ func validateInterfaceNames(alloc []allocation) error {
 
 	// Check if any of our planned renames would collide with existing interfaces
 	for _, a := range alloc {
+		if a.Manager == types.DeviceManagerTypeRXQueue {
+			continue
+		}
 		if a.Config.PodIfName != "" && existingNames[a.Config.PodIfName] {
 			return fmt.Errorf(
 				"interface name collision: %q already exists in pod namespace (possibly from CNI)",

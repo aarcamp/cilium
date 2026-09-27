@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/vishvananda/netlink"
@@ -29,6 +30,8 @@ const (
 	defaultReservedRXQueues = 1
 	mainRSSContext          = 0
 	firstLeasedRXQueueID    = 1
+
+	ownershipPrefix = "cilium-zcrx:"
 )
 
 var (
@@ -37,14 +40,19 @@ var (
 	errInsufficientRXQueues = errors.New("insufficient RX queues")
 	errNoAvailableRXQueue   = errors.New("no reserved RX queue is available")
 	errInvalidAllocation    = errors.New("invalid RX queue allocation")
+	errUnownedLink          = errors.New("refusing to use link not owned by the RX queue manager")
 	errActiveLease          = errors.New("RX queue lease is still active")
 
-	netlinkLinkByName     = safenetlink.LinkByName
-	netlinkNetDevQueueGet = netlink.NetDevQueueGet
-	netlinkNetDevRSSGet   = netlink.NetDevRSSGet
-	netlinkNetDevRSSSet   = netlink.NetDevRSSSet
-	netlinkNetDevRingsGet = netlink.NetDevRingsGet
-	netlinkNetDevRingsSet = netlink.NetDevRingsSet
+	netlinkLinkByName         = safenetlink.LinkByName
+	netlinkNetDevQueueGet     = netlink.NetDevQueueGet
+	netlinkNetDevRSSGet       = netlink.NetDevRSSGet
+	netlinkNetDevRSSSet       = netlink.NetDevRSSSet
+	netlinkNetDevRingsGet     = netlink.NetDevRingsGet
+	netlinkNetDevRingsSet     = netlink.NetDevRingsSet
+	netlinkLinkSetAlias       = netlink.LinkSetAlias
+	netlinkNetDevRxFlowInsert = netlink.NetDevRxFlowInsert
+	netlinkNetDevRxFlowDelete = netlink.NetDevRxFlowDelete
+	netlinkNetDevRxFlowList   = netlink.NetDevRxFlowList
 )
 
 type RXQueueManager struct {
@@ -437,12 +445,16 @@ type RXQueueDevice struct {
 	TotalRXQueues    int      `json:"totalRXQueues"`
 	ReservedQueueIDs []uint32 `json:"reservedQueueIDs"`
 
-	Prepared        bool           `json:"prepared,omitempty"`
-	ShareID         kube_types.UID `json:"shareID,omitempty"`
-	PodIfName       string         `json:"podIfName,omitempty"`
-	PhysicalQueueID uint32         `json:"physicalQueueID,omitempty"`
-	VirtualQueueID  uint32         `json:"virtualQueueID,omitempty"`
-	reservations    *queueReservations
+	Prepared          bool           `json:"prepared,omitempty"`
+	Bound             bool           `json:"bound,omitempty"`
+	ShareID           kube_types.UID `json:"shareID,omitempty"`
+	PodIfName         string         `json:"podIfName,omitempty"`
+	HostIfName        string         `json:"hostIfName,omitempty"`
+	OriginalHostAlias string         `json:"originalHostAlias,omitempty"`
+	PhysicalQueueID   uint32         `json:"physicalQueueID,omitempty"`
+	VirtualQueueID    uint32         `json:"virtualQueueID,omitempty"`
+	rxFlows           []rxFlowState
+	reservations      *queueReservations
 
 	mu sync.Mutex
 }
@@ -534,6 +546,10 @@ func validateAllocation(allocation types.DeviceAllocation) error {
 	return nil
 }
 
+func ownershipAlias(owner string) string {
+	return ownershipPrefix + owner
+}
+
 func netlinkNetDevQueueGetByName(ifName string, queueID uint32) (*netlink.NetDevQueue, error) {
 	link, err := netlinkLinkByName(ifName)
 	if err != nil {
@@ -544,6 +560,14 @@ func netlinkNetDevQueueGetByName(ifName string, queueID uint32) (*netlink.NetDev
 		return nil, fmt.Errorf("failed to inspect RX queue %s/%d: %w", ifName, queueID, err)
 	}
 	return queue, nil
+}
+
+func leaseMatches(lease *netlink.NetDevQueueLease, peerIfIndex int, peerNetNSID int32) bool {
+	return lease != nil &&
+		lease.IfIndex == uint32(peerIfIndex) &&
+		lease.Queue.Type == netlink.NetDevQueueTypeRx &&
+		lease.NetNSIDSet &&
+		lease.NetNSID == peerNetNSID
 }
 
 func (d *RXQueueDevice) Free(allocation types.DeviceAllocation) error {
@@ -568,6 +592,29 @@ func (d *RXQueueDevice) Free(allocation types.DeviceAllocation) error {
 		return fmt.Errorf("%w: %s/%d", errActiveLease, d.PhysicalIfName, d.PhysicalQueueID)
 	}
 
+	locations := ownershipFromFlowStates(d.rxFlows).locations
+	var host netlink.Link
+	if d.HostIfName != "" {
+		host, err = netlinkLinkByName(d.HostIfName)
+		if err != nil && !errors.As(err, &netlink.LinkNotFoundError{}) {
+			return fmt.Errorf("failed to find Pod netkit host %s: %w", d.HostIfName, err)
+		}
+		if err == nil {
+			ownership, ownershipErr := ownedRXFlows(host, string(d.ShareID), d.OriginalHostAlias)
+			if ownershipErr != nil {
+				return ownershipErr
+			}
+			locations = ownership.locations
+		}
+	}
+	if err := deleteRXFlows(d.PhysicalIfName, locations); err != nil {
+		return fmt.Errorf("failed to delete RX flow rules for %s: %w", d.PhysicalIfName, err)
+	}
+	if host != nil && strings.HasPrefix(host.Attrs().Alias, ownershipAlias(string(d.ShareID))) {
+		if err := netlinkLinkSetAlias(host, d.OriginalHostAlias); err != nil {
+			return fmt.Errorf("failed to restore alias on Pod netkit host %s: %w", d.HostIfName, err)
+		}
+	}
 	d.releaseReservation()
 	return nil
 }
@@ -605,30 +652,38 @@ func (d *RXQueueDevice) KernelIfName() string {
 func (d *RXQueueDevice) Merge(_ types.Device) {}
 
 type deviceState struct {
-	PhysicalIfName   string         `json:"physicalIfName"`
-	HardwareAddress  string         `json:"hardwareAddress,omitempty"`
-	MTU              int            `json:"mtu,omitempty"`
-	TotalRXQueues    int            `json:"totalRXQueues"`
-	ReservedQueueIDs []uint32       `json:"reservedQueueIDs"`
-	Prepared         bool           `json:"prepared,omitempty"`
-	ShareID          kube_types.UID `json:"shareID,omitempty"`
-	PodIfName        string         `json:"podIfName,omitempty"`
-	PhysicalQueueID  uint32         `json:"physicalQueueID,omitempty"`
-	VirtualQueueID   uint32         `json:"virtualQueueID,omitempty"`
+	PhysicalIfName    string         `json:"physicalIfName"`
+	HardwareAddress   string         `json:"hardwareAddress,omitempty"`
+	MTU               int            `json:"mtu,omitempty"`
+	TotalRXQueues     int            `json:"totalRXQueues"`
+	ReservedQueueIDs  []uint32       `json:"reservedQueueIDs"`
+	Prepared          bool           `json:"prepared,omitempty"`
+	Bound             bool           `json:"bound,omitempty"`
+	ShareID           kube_types.UID `json:"shareID,omitempty"`
+	PodIfName         string         `json:"podIfName,omitempty"`
+	HostIfName        string         `json:"hostIfName,omitempty"`
+	OriginalHostAlias string         `json:"originalHostAlias,omitempty"`
+	PhysicalQueueID   uint32         `json:"physicalQueueID,omitempty"`
+	VirtualQueueID    uint32         `json:"virtualQueueID,omitempty"`
+	RXFlows           []rxFlowState  `json:"rxFlows,omitempty"`
 }
 
 func (d *RXQueueDevice) MarshalBinary() ([]byte, error) {
 	return json.Marshal(deviceState{
-		PhysicalIfName:   d.PhysicalIfName,
-		HardwareAddress:  d.HardwareAddress,
-		MTU:              d.MTU,
-		TotalRXQueues:    d.TotalRXQueues,
-		ReservedQueueIDs: d.ReservedQueueIDs,
-		Prepared:         d.Prepared,
-		ShareID:          d.ShareID,
-		PodIfName:        d.PodIfName,
-		PhysicalQueueID:  d.PhysicalQueueID,
-		VirtualQueueID:   d.VirtualQueueID,
+		PhysicalIfName:    d.PhysicalIfName,
+		HardwareAddress:   d.HardwareAddress,
+		MTU:               d.MTU,
+		TotalRXQueues:     d.TotalRXQueues,
+		ReservedQueueIDs:  d.ReservedQueueIDs,
+		Prepared:          d.Prepared,
+		Bound:             d.Bound,
+		ShareID:           d.ShareID,
+		PodIfName:         d.PodIfName,
+		HostIfName:        d.HostIfName,
+		OriginalHostAlias: d.OriginalHostAlias,
+		PhysicalQueueID:   d.PhysicalQueueID,
+		VirtualQueueID:    d.VirtualQueueID,
+		RXFlows:           slices.Clone(d.rxFlows),
 	})
 }
 
@@ -646,6 +701,36 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	if state.Prepared && (state.ShareID == "" || state.PodIfName == "") {
 		return errors.New("prepared RX queue device is missing its allocation identity")
 	}
+	if state.Bound && (!state.Prepared || state.HostIfName == "") {
+		return errors.New("bound RX queue device is missing its Pod netkit host name")
+	}
+	if !state.Bound && len(state.RXFlows) != 0 {
+		return errors.New("unbound RX queue device contains RX flow rules")
+	}
+	if !state.Prepared && len(state.RXFlows) != 0 {
+		return errors.New("unprepared RX queue device contains RX flow rules")
+	}
+	if len(state.RXFlows) != 0 {
+		flows := make([]types.RXQueueFlow, 0, len(state.RXFlows))
+		locations := make(map[uint32]struct{}, len(state.RXFlows))
+		for _, flow := range state.RXFlows {
+			if flow.Location >= netlink.RX_CLS_LOC_LAST {
+				return fmt.Errorf("RX flow location %d is invalid", flow.Location)
+			}
+			if _, exists := locations[flow.Location]; exists {
+				return fmt.Errorf("RX flow location %d is duplicated", flow.Location)
+			}
+			locations[flow.Location] = struct{}{}
+			flows = append(flows, flow.Flow)
+		}
+		normalized, err := normalizeRXFlows(flows)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(normalized, flows) {
+			return errors.New("RX flow rules are not in canonical order")
+		}
+	}
 
 	d.PhysicalIfName = state.PhysicalIfName
 	d.HardwareAddress = state.HardwareAddress
@@ -653,9 +738,13 @@ func (d *RXQueueDevice) UnmarshalBinary(data []byte) error {
 	d.TotalRXQueues = state.TotalRXQueues
 	d.ReservedQueueIDs = slices.Clone(state.ReservedQueueIDs)
 	d.Prepared = state.Prepared
+	d.Bound = state.Bound
 	d.ShareID = state.ShareID
 	d.PodIfName = state.PodIfName
+	d.HostIfName = state.HostIfName
+	d.OriginalHostAlias = state.OriginalHostAlias
 	d.PhysicalQueueID = state.PhysicalQueueID
 	d.VirtualQueueID = state.VirtualQueueID
+	d.rxFlows = slices.Clone(state.RXFlows)
 	return nil
 }

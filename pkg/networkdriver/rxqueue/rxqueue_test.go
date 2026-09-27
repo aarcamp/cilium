@@ -25,6 +25,8 @@ import (
 const (
 	testPhysicalIfName = "eth0"
 	testPhysicalIndex  = 10
+	testHostIndex      = 20
+	testPeerIndex      = 21
 	testShareID        = kube_types.UID("11111111-2222-3333-4444-555555555555")
 )
 
@@ -41,17 +43,25 @@ func publishedDevices(t *testing.T, mgr *RXQueueManager) []types.Device {
 }
 
 type fakeNetlink struct {
-	links          map[string]netlink.Link
-	leases         map[uint32]*netlink.NetDevQueueLease
-	realRXQueues   int
-	rss            netlink.NetDevRSS
-	rings          netlink.NetDevRings
-	rssSetCalls    []netlink.NetDevRSSConfig
-	ringsSetCalls  []netlink.NetDevRingsConfig
-	rssSetError    error
-	ringsSetError  error
-	ignoreRSSSet   bool
-	ignoreRingsSet bool
+	links                map[string]netlink.Link
+	leases               map[uint32]*netlink.NetDevQueueLease
+	realRXQueues         int
+	rss                  netlink.NetDevRSS
+	rings                netlink.NetDevRings
+	rssSetCalls          []netlink.NetDevRSSConfig
+	ringsSetCalls        []netlink.NetDevRingsConfig
+	rssSetError          error
+	ringsSetError        error
+	ignoreRSSSet         bool
+	ignoreRingsSet       bool
+	hostIfName           string
+	flows                map[uint32]netlink.NetDevRxFlow
+	flowInsertCalls      []netlink.NetDevRxFlow
+	flowDeleteCalls      []uint32
+	flowInsertErrors     map[int]error
+	flowAnyLocationError error
+	flowListError        error
+	nextFlowLocation     uint32
 }
 
 func newFakeNetlink(maxRXQueues, realRXQueues int, _ ...kube_types.UID) *fakeNetlink {
@@ -72,8 +82,11 @@ func newFakeNetlink(maxRXQueues, realRXQueues int, _ ...kube_types.UID) *fakeNet
 		links: map[string]netlink.Link{
 			testPhysicalIfName: physical,
 		},
-		leases:       make(map[uint32]*netlink.NetDevQueueLease),
-		realRXQueues: realRXQueues,
+		leases:           make(map[uint32]*netlink.NetDevQueueLease),
+		flows:            make(map[uint32]netlink.NetDevRxFlow),
+		flowInsertErrors: make(map[int]error),
+		nextFlowLocation: 100,
+		realRXQueues:     realRXQueues,
 		rss: netlink.NetDevRSS{
 			HashFunction:        netlink.NetDevRSSHashFunctionToeplitz,
 			IndirectionTable:    indirectionTable,
@@ -88,6 +101,7 @@ func newFakeNetlink(maxRXQueues, realRXQueues int, _ ...kube_types.UID) *fakeNet
 			TCPDataSplit:    netlink.NetDevTCPDataSplitDisabled,
 			HDSThresholdMax: 4096,
 		},
+		hostIfName: "lxc123",
 	}
 }
 
@@ -95,18 +109,26 @@ func (f *fakeNetlink) install(t *testing.T) {
 	t.Helper()
 
 	originalLinkByName := netlinkLinkByName
+	originalLinkSetAlias := netlinkLinkSetAlias
 	originalQueueGet := netlinkNetDevQueueGet
 	originalRSSGet := netlinkNetDevRSSGet
 	originalRSSSet := netlinkNetDevRSSSet
 	originalRingsGet := netlinkNetDevRingsGet
 	originalRingsSet := netlinkNetDevRingsSet
+	originalFlowInsert := netlinkNetDevRxFlowInsert
+	originalFlowDelete := netlinkNetDevRxFlowDelete
+	originalFlowList := netlinkNetDevRxFlowList
 	t.Cleanup(func() {
 		netlinkLinkByName = originalLinkByName
+		netlinkLinkSetAlias = originalLinkSetAlias
 		netlinkNetDevQueueGet = originalQueueGet
 		netlinkNetDevRSSGet = originalRSSGet
 		netlinkNetDevRSSSet = originalRSSSet
 		netlinkNetDevRingsGet = originalRingsGet
 		netlinkNetDevRingsSet = originalRingsSet
+		netlinkNetDevRxFlowInsert = originalFlowInsert
+		netlinkNetDevRxFlowDelete = originalFlowDelete
+		netlinkNetDevRxFlowList = originalFlowList
 	})
 
 	netlinkLinkByName = func(name string) (netlink.Link, error) {
@@ -115,6 +137,10 @@ func (f *fakeNetlink) install(t *testing.T) {
 			return nil, netlink.LinkNotFoundError{}
 		}
 		return link, nil
+	}
+	netlinkLinkSetAlias = func(link netlink.Link, alias string) error {
+		link.Attrs().Alias = alias
+		return nil
 	}
 	netlinkNetDevQueueGet = func(ifIndex int, queueID uint32, queueType netlink.NetDevQueueType) (*netlink.NetDevQueue, error) {
 		if ifIndex != testPhysicalIndex {
@@ -175,6 +201,52 @@ func (f *fakeNetlink) install(t *testing.T) {
 		}
 		return nil
 	}
+	netlinkNetDevRxFlowInsert = func(ifName string, flow netlink.NetDevRxFlow) (uint32, error) {
+		if ifName != testPhysicalIfName {
+			return 0, unix.ENODEV
+		}
+		f.flowInsertCalls = append(f.flowInsertCalls, flow)
+		if err := f.flowInsertErrors[len(f.flowInsertCalls)]; err != nil {
+			return 0, err
+		}
+		if flow.Location == netlink.RX_CLS_LOC_ANY && f.flowAnyLocationError != nil {
+			return 0, f.flowAnyLocationError
+		}
+		location := flow.Location
+		if location == netlink.RX_CLS_LOC_ANY {
+			location = f.nextFlowLocation
+			f.nextFlowLocation++
+		}
+		flow.Location = location
+		f.flows[location] = flow
+		return location, nil
+	}
+	netlinkNetDevRxFlowDelete = func(ifName string, location uint32) error {
+		if ifName != testPhysicalIfName {
+			return unix.ENODEV
+		}
+		f.flowDeleteCalls = append(f.flowDeleteCalls, location)
+		delete(f.flows, location)
+		return nil
+	}
+	netlinkNetDevRxFlowList = func(ifName string) ([]uint32, error) {
+		if ifName != testPhysicalIfName {
+			return nil, unix.ENODEV
+		}
+		if f.flowListError != nil {
+			return nil, f.flowListError
+		}
+		locations := make([]uint32, 0, len(f.flows))
+		for location := range f.flows {
+			locations = append(locations, location)
+		}
+		slices.Sort(locations)
+		return locations, nil
+	}
+}
+
+func testDevice(total int) *RXQueueDevice {
+	return testDeviceWithCount(total, defaultReservedRXQueues)
 }
 
 func testDeviceWithCount(total, count int) *RXQueueDevice {

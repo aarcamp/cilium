@@ -376,6 +376,45 @@ func namedObject(ns, name string, uid kubetypes.UID) kubeletplugin.NamespacedObj
 	}
 }
 
+func TestConflictingRXQueueInterfaceForPod(t *testing.T) {
+	client, _ := k8sClient.NewFakeClientset(hivetest.Logger(t))
+	driver := buildPrepDriver(t, client)
+
+	wtxn := driver.db.WriteTxn(driver.allocationTable)
+	driver.allocationTable.Insert(wtxn, &DRAAllocation{
+		DeviceName: prepTestDev0,
+		Manager:    types.DeviceManagerTypeRXQueue,
+		PodUID:     prepTestPodUID,
+		ClaimUID:   prepTestClaimUID,
+		Config: types.DeviceConfig{
+			RXQueue: &types.RXQueueConfig{},
+		},
+	})
+	wtxn.Commit()
+
+	results := []resourceapi.DeviceRequestAllocationResult{{Request: "rx"}}
+	configs := map[string]types.DeviceConfig{
+		"rx": {RXQueue: &types.RXQueueConfig{}},
+	}
+	require.Equal(t, types.DefaultRXQueuePodIfName,
+		driver.conflictingRXQueueInterfaceForPod(
+			prepTestPodUID, prepTestClaimUID2, results, configs,
+		),
+	)
+	require.Empty(t, driver.conflictingRXQueueInterfaceForPod(
+		prepTestPodUID, prepTestClaimUID, results, configs,
+	), "an idempotent retry must ignore its own existing allocation")
+
+	results = append(results, resourceapi.DeviceRequestAllocationResult{Request: "rx-again"})
+	configs["rx"] = types.DeviceConfig{
+		PodIfName: "net1",
+		RXQueue:   &types.RXQueueConfig{},
+	}
+	configs["rx-again"] = configs["rx"]
+	require.Equal(t, "net1", driver.conflictingRXQueueInterfaceForPod(
+		"different-pod", "", results, configs,
+	))
+}
 func TestPrepare(t *testing.T) {
 	tlog := hivetest.Logger(t)
 

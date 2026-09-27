@@ -195,7 +195,6 @@ func ownershipFromFlowStates(flows []rxFlowState) rxFlowOwnership {
 func (d *RXQueueDevice) SetRXQueueFlows(flows []types.RXQueueFlow) (types.Device, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
 	desired, err := normalizeRXFlows(flows)
 	if err != nil {
 		return nil, err

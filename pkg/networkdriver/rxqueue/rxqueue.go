@@ -636,8 +636,8 @@ func validateAllocation(allocation types.DeviceAllocation) error {
 	return nil
 }
 
-func ownershipAlias(owner string) string {
-	return ownershipPrefix + owner
+func ownershipAlias(ifName string) string {
+	return ownershipPrefix + ifName
 }
 
 func netlinkNetDevQueueGetByName(ifName string, queueID uint32) (*netlink.NetDevQueue, error) {

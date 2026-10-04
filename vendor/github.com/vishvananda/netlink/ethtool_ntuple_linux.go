@@ -1,6 +1,7 @@
 package netlink
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"runtime"
@@ -30,21 +31,38 @@ const (
 	ETHER_FLOW  = 0x12
 )
 
-// Special location values for rule insertion.
+// Special location values for rule insertion. RX_CLS_LOC_SPECIAL is the flag
+// that marks them, and that a driver reports when it accepts them.
 const (
-	RX_CLS_LOC_ANY   uint32 = 0xffffffff
-	RX_CLS_LOC_FIRST uint32 = 0xfffffffe
-	RX_CLS_LOC_LAST  uint32 = 0xfffffffd
+	RX_CLS_LOC_SPECIAL uint32 = 0x80000000
+	RX_CLS_LOC_ANY     uint32 = 0xffffffff
+	RX_CLS_LOC_FIRST   uint32 = 0xfffffffe
+	RX_CLS_LOC_LAST    uint32 = 0xfffffffd
 )
 
 // ETHTOOL_RX_FLOW_SPEC_RING masks the queue index out of ring_cookie (the low
 // 32 bits); bits 32-39 hold an optional VF id which we leave zero.
 const ethtoolRxFlowSpecRing = 0x00000000FFFFFFFF
 
-// NetDevRxFlow is a typed RX flow steering rule. Exactly one of the typed match
-// fields (Ether, TCP4, ...) must be set; it identifies the flow to match and
-// supplies both the value (h_u) and mask (m_u) halves of the rule. Queue is the
-// target RX queue index that matching packets are delivered to (the "action").
+// Special ring_cookie values (RX_CLS_FLOW_DISC and RX_CLS_FLOW_WAKE in
+// ethtool.h) that discard matching packets or use them for Wake-on-LAN.
+const (
+	ethtoolRxClsFlowDisc = 0xffffffffffffffff
+	ethtoolRxClsFlowWake = 0xfffffffffffffffe
+)
+
+// Flags ORed into ethtoolRxFlowSpec.flowType (FLOW_EXT, FLOW_MAC_EXT and
+// FLOW_RSS in ethtool.h).
+const (
+	ethtoolFlowExt    = 0x80000000
+	ethtoolFlowMACExt = 0x40000000
+	ethtoolFlowRSS    = 0x20000000
+)
+
+// NetDevRxFlow is a typed RX flow steering rule. Match identifies the flow to
+// match and supplies both the value (h_u) and mask (m_u) halves of the rule.
+// Queue is the target RX queue index that matching packets are delivered to
+// (the "action").
 type NetDevRxFlow struct {
 	// Match is the flow matcher; its concrete type selects the flow type.
 	Match NetDevRxFlowMatch
@@ -117,6 +135,43 @@ func (f TCPIP4Fields) serialize() (val [52]byte, mask [52]byte) {
 	putIP4(mask[4:8], f.DstIPMask)
 	networkOrder.PutUint16(mask[8:10], f.SrcPortMask)
 	networkOrder.PutUint16(mask[10:12], f.DstPortMask)
+	return val, mask
+}
+
+// TCP6Flow and UDP6Flow match on IPv6 TCP/UDP 5-tuple fields. Addresses are
+// serialized as 16 network-order bytes, and ports are serialized in network
+// byte order as struct ethtool_tcpip6_spec expects. A zero mask field means
+// "don't care". Address masks are passed to the kernel unchanged, so callers
+// can use IPv6 CIDR masks; individual drivers may restrict which masks their
+// hardware can offload.
+type TCP6Flow struct{ TCPIP6Fields }
+type UDP6Flow struct{ TCPIP6Fields }
+
+// TCPIP6Fields holds the IPv6 TCP/UDP match fields shared by TCP6Flow/UDP6Flow.
+type TCPIP6Fields struct {
+	SrcIP, SrcIPMask     net.IP // IPv6
+	DstIP, DstIPMask     net.IP
+	SrcPort, SrcPortMask uint16
+	DstPort, DstPortMask uint16
+}
+
+func (TCP6Flow) flowType() uint32 { return TCP_V6_FLOW }
+func (UDP6Flow) flowType() uint32 { return UDP_V6_FLOW }
+
+func (f TCP6Flow) serialize() ([52]byte, [52]byte) { return f.TCPIP6Fields.serialize() }
+func (f UDP6Flow) serialize() ([52]byte, [52]byte) { return f.TCPIP6Fields.serialize() }
+
+func (f TCPIP6Fields) serialize() (val [52]byte, mask [52]byte) {
+	// struct ethtool_tcpip6_spec { __be32 ip6src[4]; __be32 ip6dst[4];
+	//                              __be16 psrc; __be16 pdst; __u8 tclass; }
+	putIP6(val[0:16], f.SrcIP)
+	putIP6(val[16:32], f.DstIP)
+	networkOrder.PutUint16(val[32:34], f.SrcPort)
+	networkOrder.PutUint16(val[34:36], f.DstPort)
+	putIP6(mask[0:16], f.SrcIPMask)
+	putIP6(mask[16:32], f.DstIPMask)
+	networkOrder.PutUint16(mask[32:34], f.SrcPortMask)
+	networkOrder.PutUint16(mask[34:36], f.DstPortMask)
 	return val, mask
 }
 
@@ -254,6 +309,15 @@ func putIP4(dst []byte, ip net.IP) {
 	}
 }
 
+func putIP6(dst []byte, ip net.IP) {
+	if ip.To4() != nil {
+		return
+	}
+	if ip6 := ip.To16(); ip6 != nil {
+		copy(dst, ip6)
+	}
+}
+
 func validateHardwareAddr(field string, addr net.HardwareAddr) error {
 	if len(addr) != 0 && len(addr) != 6 {
 		return fmt.Errorf("netlink: %s must contain exactly 6 bytes", field)
@@ -264,6 +328,13 @@ func validateHardwareAddr(field string, addr net.HardwareAddr) error {
 func validateIPv4(field string, ip net.IP) error {
 	if len(ip) != 0 && ip.To4() == nil {
 		return fmt.Errorf("netlink: %s must be an IPv4 address", field)
+	}
+	return nil
+}
+
+func validateIPv6(field string, ip net.IP) error {
+	if len(ip) != 0 && (ip.To16() == nil || ip.To4() != nil) {
+		return fmt.Errorf("netlink: %s must be an IPv6 address", field)
 	}
 	return nil
 }
@@ -291,6 +362,20 @@ func validateNetDevRxFlowMatch(match NetDevRxFlowMatch) error {
 			return fmt.Errorf("netlink: NetDevRxFlow.Match must be set")
 		}
 		return validateTCPIP4Fields("UDP4Flow", m.TCPIP4Fields)
+	case TCP6Flow:
+		return validateTCPIP6Fields("TCP6Flow", m.TCPIP6Fields)
+	case *TCP6Flow:
+		if m == nil {
+			return fmt.Errorf("netlink: NetDevRxFlow.Match must be set")
+		}
+		return validateTCPIP6Fields("TCP6Flow", m.TCPIP6Fields)
+	case UDP6Flow:
+		return validateTCPIP6Fields("UDP6Flow", m.TCPIP6Fields)
+	case *UDP6Flow:
+		if m == nil {
+			return fmt.Errorf("netlink: NetDevRxFlow.Match must be set")
+		}
+		return validateTCPIP6Fields("UDP6Flow", m.TCPIP6Fields)
 	default:
 		return fmt.Errorf("netlink: unsupported NetDevRxFlow.Match type %T", match)
 	}
@@ -326,6 +411,24 @@ func validateTCPIP4Fields(flowType string, fields TCPIP4Fields) error {
 	}
 	for _, address := range addresses {
 		if err := validateIPv4(address.name, address.ip); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateTCPIP6Fields(flowType string, fields TCPIP6Fields) error {
+	addresses := []struct {
+		name string
+		ip   net.IP
+	}{
+		{flowType + ".SrcIP", fields.SrcIP},
+		{flowType + ".SrcIPMask", fields.SrcIPMask},
+		{flowType + ".DstIP", fields.DstIP},
+		{flowType + ".DstIPMask", fields.DstIPMask},
+	}
+	for _, address := range addresses {
+		if err := validateIPv6(address.name, address.ip); err != nil {
 			return err
 		}
 	}
@@ -414,6 +517,210 @@ func parseNetDevRxFlowLocations(buf []byte, layout ethtoolRxnfcLayout, capacity 
 		locs[i] = native.Uint32(buf[off : off+4])
 	}
 	return locs, nil
+}
+
+// NetDevRxFlowTable describes the RX flow steering rule table of a device.
+type NetDevRxFlowTable struct {
+	// Rules is the number of rules currently installed.
+	Rules uint32
+	// Size is the number of rule locations, or zero if the driver does not
+	// report it.
+	Size uint32
+	// SpecialLocations reports whether the driver accepts RX_CLS_LOC_ANY,
+	// RX_CLS_LOC_FIRST and RX_CLS_LOC_LAST as insert locations. Otherwise
+	// callers must choose a location below Size themselves.
+	SpecialLocations bool
+}
+
+// NetDevRxFlowTableGet returns the RX flow steering rule table of dev.
+func NetDevRxFlowTableGet(dev string) (*NetDevRxFlowTable, error) {
+	nfc := ethtoolRxnfc{cmd: ETHTOOL_GRXCLSRLCNT}
+	if err := ethtoolRxnfcIoctl(dev, &nfc); err != nil {
+		return nil, err
+	}
+	return parseNetDevRxFlowTable(&nfc), nil
+}
+
+func parseNetDevRxFlowTable(nfc *ethtoolRxnfc) *NetDevRxFlowTable {
+	// The low 32 bits of data hold the table size and the special location flag.
+	data := uint32(nfc.data)
+	return &NetDevRxFlowTable{
+		Rules:            nfc.ruleCntOrRssCtx,
+		Size:             data &^ RX_CLS_LOC_SPECIAL,
+		SpecialLocations: data&RX_CLS_LOC_SPECIAL != 0,
+	}
+}
+
+// NetDevRxFlowAction describes what an RX flow steering rule does with the
+// packets it matches.
+type NetDevRxFlowAction struct {
+	// Drop is set for rules that discard matching packets.
+	Drop bool
+	// WakeOnLAN is set for rules that use matching packets to wake the system.
+	WakeOnLAN bool
+	// VF is zero for rules that deliver to the device itself, or one more than
+	// the index of the virtual function that receives matching packets.
+	VF uint8
+	// Queue is the receive queue for matching packets. If UsesRSSContext is
+	// set, Queue is added to the queue that RSSContext selects instead.
+	Queue uint32
+	// UsesRSSContext is set for rules that spread matching packets over the
+	// queues of RSSContext.
+	UsesRSSContext bool
+	RSSContext     uint32
+}
+
+// NetDevRxFlowActionGet returns the action of the RX flow steering rule at the
+// given location on dev. Unlike NetDevRxFlowGet, it succeeds for every rule,
+// whatever the rule matches on.
+func NetDevRxFlowActionGet(dev string, location uint32) (*NetDevRxFlowAction, error) {
+	nfc := ethtoolRxnfc{
+		cmd: ETHTOOL_GRXCLSRULE,
+		fs:  ethtoolRxFlowSpec{location: location},
+	}
+	if err := ethtoolRxnfcIoctl(dev, &nfc); err != nil {
+		return nil, err
+	}
+	return parseNetDevRxFlowAction(&nfc), nil
+}
+
+func parseNetDevRxFlowAction(nfc *ethtoolRxnfc) *NetDevRxFlowAction {
+	switch nfc.fs.ringCookie {
+	case ethtoolRxClsFlowDisc:
+		return &NetDevRxFlowAction{Drop: true}
+	case ethtoolRxClsFlowWake:
+		return &NetDevRxFlowAction{WakeOnLAN: true}
+	}
+	action := &NetDevRxFlowAction{
+		VF:    uint8(nfc.fs.ringCookie >> 32),
+		Queue: uint32(nfc.fs.ringCookie & ethtoolRxFlowSpecRing),
+	}
+	if nfc.fs.flowType&ethtoolFlowRSS != 0 {
+		action.UsesRSSContext = true
+		action.RSSContext = nfc.ruleCntOrRssCtx
+	}
+	return action
+}
+
+// NetDevRxFlowGet returns the RX flow steering rule at the given location on
+// dev. If the rule uses a flow type, match field, extension or action that
+// NetDevRxFlow cannot represent, the returned error wraps ErrNotImplemented.
+// Equivalent to: ethtool --show-ntuple <dev> rule <location>
+func NetDevRxFlowGet(dev string, location uint32) (*NetDevRxFlow, error) {
+	nfc := ethtoolRxnfc{
+		cmd: ETHTOOL_GRXCLSRULE,
+		fs:  ethtoolRxFlowSpec{location: location},
+	}
+	if err := ethtoolRxnfcIoctl(dev, &nfc); err != nil {
+		return nil, err
+	}
+	return parseNetDevRxFlow(&nfc.fs)
+}
+
+func parseNetDevRxFlow(fs *ethtoolRxFlowSpec) (*NetDevRxFlow, error) {
+	if fs.flowType&ethtoolFlowRSS != 0 {
+		return nil, fmt.Errorf("netlink: RX flow rule %d targets an RSS context: %w",
+			fs.location, ErrNotImplemented)
+	}
+	// Drop, wake-on-LAN and VF actions set bits above the queue index.
+	if fs.ringCookie&^ethtoolRxFlowSpecRing != 0 {
+		return nil, fmt.Errorf("netlink: RX flow rule %d action %#x is not a queue: %w",
+			fs.location, fs.ringCookie, ErrNotImplemented)
+	}
+	if fs.mExt != [20]byte{} {
+		return nil, fmt.Errorf("netlink: RX flow rule %d uses flow extensions: %w",
+			fs.location, ErrNotImplemented)
+	}
+
+	var match NetDevRxFlowMatch
+	switch fs.flowType &^ (ethtoolFlowExt | ethtoolFlowMACExt) {
+	case ETHER_FLOW:
+		match = EtherFlow{
+			DstMAC:     macFromBytes(fs.hU[0:6]),
+			SrcMAC:     macFromBytes(fs.hU[6:12]),
+			EthProto:   networkOrder.Uint16(fs.hU[12:14]),
+			DstMACMask: macFromBytes(fs.mU[0:6]),
+			SrcMACMask: macFromBytes(fs.mU[6:12]),
+			ProtoMask:  networkOrder.Uint16(fs.mU[12:14]),
+		}
+	case TCP_V4_FLOW:
+		match = TCP4Flow{parseTCPIP4Fields(&fs.hU, &fs.mU)}
+	case UDP_V4_FLOW:
+		match = UDP4Flow{parseTCPIP4Fields(&fs.hU, &fs.mU)}
+	case TCP_V6_FLOW:
+		match = TCP6Flow{parseTCPIP6Fields(&fs.hU, &fs.mU)}
+	case UDP_V6_FLOW:
+		match = UDP6Flow{parseTCPIP6Fields(&fs.hU, &fs.mU)}
+	default:
+		return nil, fmt.Errorf("netlink: RX flow rule %d has unsupported flow type %#x: %w",
+			fs.location, fs.flowType, ErrNotImplemented)
+	}
+
+	// Serializing the decoded mask reproduces the kernel's mask only if no
+	// field outside the typed matcher, such as the IPv4 TOS or IPv6 traffic
+	// class, takes part in the match.
+	if _, mask := match.serialize(); mask != fs.mU {
+		return nil, fmt.Errorf("netlink: RX flow rule %d matches fields that %T does not support: %w",
+			fs.location, match, ErrNotImplemented)
+	}
+
+	return &NetDevRxFlow{
+		Match:    match,
+		Queue:    uint32(fs.ringCookie),
+		Location: fs.location,
+	}, nil
+}
+
+func parseTCPIP4Fields(val, mask *[52]byte) TCPIP4Fields {
+	return TCPIP4Fields{
+		SrcIP:       ipFromBytes(val[0:4]),
+		DstIP:       ipFromBytes(val[4:8]),
+		SrcPort:     networkOrder.Uint16(val[8:10]),
+		DstPort:     networkOrder.Uint16(val[10:12]),
+		SrcIPMask:   ipFromBytes(mask[0:4]),
+		DstIPMask:   ipFromBytes(mask[4:8]),
+		SrcPortMask: networkOrder.Uint16(mask[8:10]),
+		DstPortMask: networkOrder.Uint16(mask[10:12]),
+	}
+}
+
+func parseTCPIP6Fields(val, mask *[52]byte) TCPIP6Fields {
+	return TCPIP6Fields{
+		SrcIP:       ipFromBytes(val[0:16]),
+		DstIP:       ipFromBytes(val[16:32]),
+		SrcPort:     networkOrder.Uint16(val[32:34]),
+		DstPort:     networkOrder.Uint16(val[34:36]),
+		SrcIPMask:   ipFromBytes(mask[0:16]),
+		DstIPMask:   ipFromBytes(mask[16:32]),
+		SrcPortMask: networkOrder.Uint16(mask[32:34]),
+		DstPortMask: networkOrder.Uint16(mask[34:36]),
+	}
+}
+
+// macFromBytes and ipFromBytes return nil for an all-zero field, which
+// serializes the same way, so fields left unset on insert are also unset on
+// get.
+func macFromBytes(b []byte) net.HardwareAddr {
+	if allZero(b) {
+		return nil
+	}
+	return net.HardwareAddr(bytes.Clone(b))
+}
+
+func ipFromBytes(b []byte) net.IP {
+	if allZero(b) {
+		return nil
+	}
+	return net.IP(bytes.Clone(b))
+}
+
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // ethtoolRxnfcIoctl runs SIOCETHTOOL with a fixed-size ethtool_rxnfc argument.

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"regexp"
 	"strings"
 
@@ -249,6 +250,13 @@ type RXQueuePodEndpoint struct {
 type RXQueueServiceEndpoint struct {
 	ServiceName string `json:"serviceName"`
 	Port        string `json:"port"`
+}
+
+// RXQueueFlow identifies traffic to steer to an allocated RX queue.
+type RXQueueFlow struct {
+	DestinationIP   netip.Addr      `json:"destinationIP"`
+	DestinationPort uint16          `json:"destinationPort"`
+	Protocol        corev1.Protocol `json:"protocol"`
 }
 
 // DeviceAllocation contains scheduler and driver parameters for one allocation.

@@ -38,6 +38,7 @@ import (
 	kubetypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
+	"github.com/cilium/cilium/pkg/datapath/xdp"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
 	"github.com/cilium/cilium/pkg/networkdriver/dummy"
@@ -92,6 +93,21 @@ func buildDriverForPool(t *testing.T, pools []v2alpha1.CiliumNetworkDriverDevice
 		podNetns:        make(map[kubetypes.UID]string),
 	}
 	return d
+}
+
+func TestValidateRXQueueDatapath(t *testing.T) {
+	disabled := &v2alpha1.CiliumNetworkDriverDeviceManagerConfig{
+		RXQueue: &v2alpha1.RXQueueDeviceManagerConfig{},
+	}
+	enabled := &v2alpha1.CiliumNetworkDriverDeviceManagerConfig{
+		RXQueue: &v2alpha1.RXQueueDeviceManagerConfig{Enabled: true},
+	}
+
+	require.NoError(t, validateRXQueueDatapath(nil, xdp.AccelerationModeNative))
+	require.NoError(t, validateRXQueueDatapath(disabled, xdp.AccelerationModeNative))
+	require.NoError(t, validateRXQueueDatapath(enabled, xdp.AccelerationModeDisabled))
+	require.ErrorContains(t, validateRXQueueDatapath(enabled, xdp.AccelerationModeBestEffort),
+		"incompatible with XDP acceleration")
 }
 
 // matchingDevice is a trackedDevice whose Match() returns the supplied bool.

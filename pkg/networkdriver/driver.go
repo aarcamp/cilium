@@ -32,7 +32,9 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/xdp"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/k8s/version"
+	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/networkdriver/devicemanagers"
@@ -78,6 +80,12 @@ type Driver struct {
 	deviceTable     statedb.RWTable[*DRADevice]
 	allocationTable statedb.RWTable[*DRAAllocation]
 	localNodeStore  *node.LocalNodeStore
+
+	// RX queue flow steering is derived from these tables.
+	rxQueueFlows statedb.RWTable[*RXQueueFlows]
+	localPods    statedb.Table[k8sTables.LocalPod]
+	services     statedb.Table[*loadbalancer.Service]
+	backends     statedb.Table[*loadbalancer.Backend]
 }
 
 type allocation struct {
@@ -292,6 +300,13 @@ func (driver *Driver) Start(ctx cell.HookContext) error {
 		if err := driver.startNRI(ctx); err != nil {
 			driver.Stop(ctx)
 			return err
+		}
+
+		if _, enabled := driver.deviceManagers[types.DeviceManagerTypeRXQueue]; enabled {
+			driver.jg.Add(job.OneShot(
+				"network-driver-rx-queue-flows",
+				driver.runRXQueueFlowController,
+			))
 		}
 
 		// Publish loop: re-publish ResourceSlices whenever inventory or

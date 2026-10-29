@@ -25,6 +25,7 @@ import (
 	"github.com/cilium/cilium/pkg/byteorder"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/tables"
+	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	cilium_api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/lbipamconfig"
 	"github.com/cilium/cilium/pkg/loadbalancer"
@@ -153,6 +154,11 @@ type nodePortAddrKey struct {
 
 	// port is the Layer 4 port number of the key
 	port uint16
+
+	// scope is the lookup scope of the key. A NodePort service with mixed
+	// traffic policies has an external and an internal frontend for the same
+	// port, and each must track its own expanded addresses.
+	scope uint8
 }
 
 type backendState struct {
@@ -423,7 +429,7 @@ func (ops *BPFOps) Delete(_ context.Context, txn statedb.ReadTxn, _ statedb.Revi
 
 	if isExpansion {
 		proto := loadbalancer.L4TypeAsProtocolNumber(fe.Address.Protocol())
-		key := nodePortAddrKey{family: fe.Address.IsIPv6(), port: fe.Address.Port(), protocol: proto}
+		key := nodePortAddrKey{family: fe.Address.IsIPv6(), port: fe.Address.Port(), protocol: proto, scope: fe.Address.Scope()}
 		addrs := ops.nodePortAddrByPort[key]
 		for _, addr := range addrs {
 			fe = fe.Clone()
@@ -910,7 +916,7 @@ func (ops *BPFOps) Update(_ context.Context, txn statedb.ReadTxn, _ statedb.Revi
 		// For NodePort create entries for each node address.
 		// For HostPort only create them if the address was not specified (HostIP is unset).
 		proto := loadbalancer.L4TypeAsProtocolNumber(fe.Address.Protocol())
-		key := nodePortAddrKey{family: fe.Address.IsIPv6(), port: fe.Address.Port(), protocol: proto}
+		key := nodePortAddrKey{family: fe.Address.IsIPv6(), port: fe.Address.Port(), protocol: proto, scope: fe.Address.Scope()}
 		old := sets.New(ops.nodePortAddrByPort[key]...)
 
 		// Collect matching node addresses for datapath candidates, skipping those
@@ -1424,7 +1430,7 @@ func (ops *BPFOps) isWildcardClass(svc *loadbalancer.Service) bool {
 	// The service has a loadBalancerClass, so we only include a wildcard
 	// service entry if it's a class Cilium actively manages, again to avoid
 	// programming wildcard entries for IP addresses we don't manage.
-	return *lbClass == cilium_api_v2alpha1.BGPLoadBalancerClass ||
+	return *lbClass == cilium_api_v2.BGPLoadBalancerClass ||
 		*lbClass == cilium_api_v2alpha1.L2AnnounceLoadBalancerClass
 }
 

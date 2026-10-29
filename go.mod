@@ -337,6 +337,9 @@ require (
 // as to why we are using a private fork.
 replace sigs.k8s.io/controller-tools => github.com/cilium/controller-tools v0.22.0-1
 
+// Temporary until the RX flow steering queries are available upstream.
+replace github.com/vishvananda/netlink => github.com/aarcamp/netlink v0.0.0-20261026105100-4832fd38204e
+
 tool (
 	github.com/cilium/cilium/tools/dpgen
 	github.com/cilium/deepequal-gen

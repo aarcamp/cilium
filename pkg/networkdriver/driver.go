@@ -30,6 +30,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/datapath/connector"
 	"github.com/cilium/cilium/pkg/datapath/xdp"
+	"github.com/cilium/cilium/pkg/endpointstate"
 	"github.com/cilium/cilium/pkg/ipam"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -40,6 +41,7 @@ import (
 	"github.com/cilium/cilium/pkg/networkdriver/types"
 	"github.com/cilium/cilium/pkg/node"
 	nodetypes "github.com/cilium/cilium/pkg/node/types"
+	"github.com/cilium/cilium/pkg/promise"
 	ciliumslices "github.com/cilium/cilium/pkg/slices"
 	"github.com/cilium/cilium/pkg/time"
 )
@@ -78,13 +80,13 @@ type Driver struct {
 	config    *v2alpha1.CiliumNetworkDriverNodeConfigSpec
 
 	deviceManagers map[types.DeviceManagerType]types.DeviceManager
-	// pod.UID: network namespace path. Captured at RunPodSandbox (and rebuilt on
+	// Sandbox ID: network namespace path. Captured at RunPodSandbox (and rebuilt on
 	// plugin (re)connect via Synchronize) so StopPodSandbox can recover the netns on
 	// containerd < 2.1, where the stop event carries no namespaces: the sandbox task
 	// is already killed, so the NRI PodSandbox spec comes back empty. containerd
 	// removes the netns only after the StopPodSandbox hook returns, so the cached
 	// path is still valid when we use it. Guarded by lock.
-	podNetns map[kube_types.UID]string
+	podNetns map[string]string
 
 	db              *statedb.DB
 	deviceTable     statedb.RWTable[*DRADevice]
@@ -95,8 +97,12 @@ type Driver struct {
 	multiPoolMgr *ipam.MultiPoolManager
 	ipv4Enabled  bool
 	ipv6Enabled  bool
+	ipamMode     string
 
 	configModifiers []claimConfigModifier
+
+	endpoints        rxQueueEndpointLookup
+	endpointRestorer promise.Promise[endpointstate.Restorer]
 }
 
 type allocation struct {
@@ -314,6 +320,15 @@ func (driver *Driver) Start(ctx cell.HookContext) error {
 		}
 
 		driver.logger.DebugContext(ctx, "device and allocation tables initialized")
+		if _, enabled := driver.deviceManagers[types.DeviceManagerTypeRXQueue]; enabled {
+			restorer, err := driver.endpointRestorer.Await(ctx)
+			if err != nil {
+				return err
+			}
+			if err := restorer.WaitForEndpointRestoreWithoutRegeneration(ctx); err != nil {
+				return err
+			}
+		}
 
 		if err := driver.startDRA(ctx); err != nil {
 			driver.Stop(ctx)
@@ -617,8 +632,7 @@ func (driver *Driver) setConfig(config *v2alpha1.CiliumNetworkDriverNodeConfigSp
 	})
 }
 
-// updateAllocationDevice replaces a prepared device that NRI recovered on
-// demand after a reboot.
+// updateAllocationDevice publishes an updated prepared-device snapshot from NRI.
 func (driver *Driver) updateAllocationDevice(a allocation) {
 	if a.Device == nil || a.DeviceName == "" {
 		return

@@ -31,18 +31,18 @@ var (
 )
 
 // SyncRXFlows makes flows the only flow steering rules that direct traffic to
-// queueID, provided that reserved queue still belongs to shareID, and does
-// nothing otherwise. Rules are programmed while holding the reservation lock,
-// so an update for an allocation that has been freed cannot reach a queue that
-// was reserved again in the meantime.
-func (d *RXQueueDevice) SyncRXFlows(shareID kube_types.UID, queueID uint32, flows []types.RXQueueFlow) error {
+// queueID, provided that the queue still belongs to shareID and the same CNI
+// binding generation. Rules are programmed under the reservation lock so a
+// delayed update cannot outlive attachment revocation or queue reassignment.
+func (d *RXQueueDevice) SyncRXFlows(shareID kube_types.UID, queueID uint32, generation uint64, flows []types.RXQueueFlow) error {
 	if d.reservations == nil {
 		return fmt.Errorf("%w: RX queue reservation state is unavailable", errInvalidAllocation)
 	}
 	d.reservations.mu.Lock()
 	defer d.reservations.mu.Unlock()
-	owner, reserved := d.reservations.owners[queueID]
-	if !reserved || shareID == "" || owner != shareID {
+	reservation := d.reservations.queues[queueID]
+	if reservation == nil || shareID == "" || reservation.shareID != shareID || generation == 0 ||
+		reservation.binding == nil || reservation.binding.Generation != generation {
 		return nil
 	}
 	return syncRXFlows(d.PhysicalIfName, queueID, flows)

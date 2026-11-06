@@ -90,7 +90,7 @@ func buildDriverForPool(t *testing.T, pools []v2alpha1.CiliumNetworkDriverDevice
 		db:              db,
 		deviceTable:     deviceTable,
 		allocationTable: allocationTable,
-		podNetns:        make(map[kubetypes.UID]string),
+		podNetns:        make(map[string]string),
 	}
 	d.setConfig(&v2alpha1.CiliumNetworkDriverNodeConfigSpec{
 		DriverName: prepTestDriverName,
@@ -194,6 +194,7 @@ func (m *mergeTrackingDevice) Merge(old types.Device) {
 // podSandbox builds a minimal NRI PodSandbox with an optional network namespace.
 func podSandbox(uid, netnsPath string) *api.PodSandbox {
 	sb := &api.PodSandbox{
+		Id:    uid + "-sandbox",
 		Uid:   uid,
 		Linux: &api.LinuxPodSandbox{},
 	}
@@ -211,7 +212,8 @@ func buildNRIDriver(t *testing.T) *Driver {
 	tlog := hivetest.Logger(t)
 	cs, _ := k8sClient.NewFakeClientset(tlog)
 	d := buildPrepDriver(t, cs)
-	d.podNetns = make(map[kubetypes.UID]string)
+	d.podNetns = make(map[string]string)
+	d.ipamMode = "cluster-pool"
 	return d
 }
 
@@ -1228,7 +1230,7 @@ func TestGetNetworkNamespace(t *testing.T) {
 
 	t.Run("falls back to cache when sandbox has no namespaces", func(t *testing.T) {
 		d := buildNRIDriver(t)
-		d.podNetns["pod-uid-2"] = "/run/netns/cached"
+		d.podNetns["pod-uid-2-sandbox"] = "/run/netns/cached"
 		sb := podSandbox("pod-uid-2", "")
 
 		ns := d.getNetworkNamespace(sb)
@@ -1251,7 +1253,7 @@ func TestRememberNetworkNamespace(t *testing.T) {
 
 		returned := d.rememberNetworkNamespace(sb)
 		require.Equal(t, "/run/netns/xyz", returned)
-		require.Equal(t, "/run/netns/xyz", d.podNetns["pod-uid-4"])
+		require.Equal(t, "/run/netns/xyz", d.podNetns[sb.Id])
 	})
 
 	t.Run("host-network pod returns empty and is not cached", func(t *testing.T) {
@@ -1260,7 +1262,7 @@ func TestRememberNetworkNamespace(t *testing.T) {
 
 		returned := d.rememberNetworkNamespace(sb)
 		require.Empty(t, returned)
-		require.NotContains(t, d.podNetns, kubetypes.UID("pod-uid-5"))
+		require.NotContains(t, d.podNetns, sb.Id)
 	})
 }
 
@@ -1278,9 +1280,9 @@ func TestSynchronize(t *testing.T) {
 		require.NoError(t, err)
 		require.Nil(t, updates)
 
-		require.Equal(t, "/run/netns/a", d.podNetns["uid-a"])
-		require.Equal(t, "/run/netns/b", d.podNetns["uid-b"])
-		require.NotContains(t, d.podNetns, kubetypes.UID("uid-c"))
+		require.Equal(t, "/run/netns/a", d.podNetns[pods[0].Id])
+		require.Equal(t, "/run/netns/b", d.podNetns[pods[1].Id])
+		require.NotContains(t, d.podNetns, pods[2].Id)
 	})
 
 	t.Run("empty input is a no-op", func(t *testing.T) {
@@ -1316,7 +1318,7 @@ func buildDriverWithDummyManager(t *testing.T, pools []v2alpha1.CiliumNetworkDri
 	d.deviceManagers = map[types.DeviceManagerType]types.DeviceManager{
 		types.DeviceManagerTypeDummy: mgr,
 	}
-	d.podNetns = make(map[kubetypes.UID]string)
+	d.podNetns = make(map[string]string)
 	return d
 }
 

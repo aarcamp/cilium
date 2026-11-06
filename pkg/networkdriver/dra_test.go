@@ -26,6 +26,8 @@ import (
 	operatoripam "github.com/cilium/cilium/operator/pkg/networkdriver/ipam"
 	"github.com/cilium/cilium/pkg/datapath/connector/fake"
 	"github.com/cilium/cilium/pkg/datapath/xdp"
+	"github.com/cilium/cilium/pkg/endpointmanager"
+	"github.com/cilium/cilium/pkg/endpointstate"
 	"github.com/cilium/cilium/pkg/hive"
 	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipam"
@@ -34,6 +36,7 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
 	"github.com/cilium/cilium/pkg/k8s/resource"
+	k8sTables "github.com/cilium/cilium/pkg/k8s/tables"
 	"github.com/cilium/cilium/pkg/networkdriver/config"
 	"github.com/cilium/cilium/pkg/networkdriver/dummy"
 	networkdriverIPAM "github.com/cilium/cilium/pkg/networkdriver/ipam"
@@ -43,6 +46,7 @@ import (
 	"github.com/cilium/cilium/pkg/node"
 	nodetypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -689,6 +693,13 @@ func TestClaimConfigModifier(t *testing.T) {
 			registerNetworkDriver,
 			newDeviceTable,
 			newAllocationTable,
+			newRXQueueFlowsTable,
+			promise.New[endpointstate.Restorer],
+			func() endpointmanager.EndpointsLookup { return nil },
+			func() *ipam.IPAM { return &ipam.IPAM{} },
+			func(db *statedb.DB) (statedb.Table[k8sTables.LocalPod], error) {
+				return k8sTables.NewPodTable(db)
+			},
 			fake.NewVeth,
 			func() xdp.Config { return xdp.Config{} },
 			func() *option.DaemonConfig { return &option.DaemonConfig{} },
